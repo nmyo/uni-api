@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import math
 import json
 import uuid
 import codecs
@@ -1880,6 +1881,7 @@ class ModelRequestHandler:
 
                 quota_cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=0)
                 cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
+                rate_limit_cooling_time = _get_rate_limit_cooling_time(provider, status_code, error_message)
                 api_key_count = provider_api_circular_list[channel_id].get_items_count()
                 current_api = await provider_api_circular_list[channel_id].after_next_current()
 
@@ -1903,6 +1905,8 @@ class ModelRequestHandler:
                 elif api_key_count > 1 and current_api and _is_quota_exhausted_error(status_code, error_message):
                     effective_quota_cooldown = int(quota_cooling_time) if int(quota_cooling_time) > 0 else 6 * 60 * 60
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=effective_quota_cooldown)
+                elif api_key_count > 1 and current_api and rate_limit_cooling_time > 0:
+                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=rate_limit_cooling_time)
                 elif cooling_time > 0 and api_key_count > 1 \
                 and all(error not in error_message for error in exclude_error_rate_limit):
                     await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
@@ -2017,6 +2021,119 @@ def _is_quota_exhausted_error(status_code: int, details: str) -> bool:
             "payment required",
         )
     )
+
+def _extract_error_details_parts(details: Any) -> tuple[Optional[str], Optional[str], Optional[str], str]:
+    raw = str(details or "")
+    code = None
+    error_type = None
+    message = None
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if isinstance(err, dict):
+            code = err.get("code")
+            error_type = err.get("type")
+            message = err.get("message")
+        detail = parsed.get("detail")
+        if isinstance(detail, dict):
+            code = detail.get("code") or code
+            error_type = detail.get("type") or error_type
+            message = detail.get("message") or message
+
+    if code is None and (raw.startswith("{") or raw.startswith("[")):
+        try:
+            import ast
+
+            parsed_py = ast.literal_eval(raw)
+        except Exception:
+            parsed_py = None
+        if isinstance(parsed_py, dict):
+            err = parsed_py.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                error_type = err.get("type")
+                message = err.get("message")
+            detail = parsed_py.get("detail")
+            if isinstance(detail, dict):
+                code = detail.get("code") or code
+                error_type = detail.get("type") or error_type
+                message = detail.get("message") or message
+
+    return (
+        str(code).strip().lower() or None,
+        str(error_type).strip().lower() or None,
+        str(message).strip() or None,
+        raw,
+    )
+
+def _is_retryable_rate_limit_error(status_code: int, details: Any) -> bool:
+    if status_code != 429:
+        return False
+
+    code, error_type, message, raw = _extract_error_details_parts(details)
+    haystack = " ".join(part for part in (code, error_type, message, raw) if part).lower()
+    return any(
+        token in haystack
+        for token in (
+            "rate_limit_exceeded",
+            "rate limit reached",
+            "too many requests",
+            "tokens per min",
+            "requests per min",
+            "tokens per day",
+            "requests per day",
+            "please try again in",
+        )
+    )
+
+def _extract_retry_after_seconds(details: Any) -> int:
+    _, _, message, raw = _extract_error_details_parts(details)
+    haystack = " ".join(part for part in (message, raw) if part)
+    match = re.search(
+        r"try again in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec|secs|seconds?|m|min|mins|minutes?)\b",
+        haystack,
+        re.IGNORECASE,
+    )
+    if not match:
+        return 0
+
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit.startswith("ms"):
+        seconds = value / 1000.0
+    elif unit.startswith("m") and not unit.startswith("ms"):
+        seconds = value * 60.0
+    else:
+        seconds = value
+
+    return max(1, int(math.ceil(seconds)))
+
+def _get_rate_limit_cooling_time(provider: dict, status_code: int, details: Any) -> int:
+    if not _is_retryable_rate_limit_error(status_code, details):
+        return 0
+
+    configured = safe_get(
+        provider,
+        "preferences",
+        "api_key_rate_limit_cooldown_period",
+        default=safe_get(provider, "preferences", "api_key_cooldown_period", default=60),
+    )
+    try:
+        configured_seconds = int(configured)
+    except Exception:
+        configured_seconds = 60
+
+    retry_after_seconds = _extract_retry_after_seconds(details)
+    if configured_seconds > 0:
+        return max(configured_seconds, retry_after_seconds)
+    if retry_after_seconds > 0:
+        return retry_after_seconds
+    return 60
 
 def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
     if status_code not in (401, 403, 402):
@@ -2600,10 +2717,14 @@ class ResponsesRequestHandler:
                     if api_key_count > 1 and (_is_quota_exhausted_error(status_code, error_message) or is_codex_permanent_auth_failure):
                         cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=6 * 60 * 60)
                         await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
-                    else:
-                        cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
-                        if api_key_count > 1 and int(cooling_time) > 0:
-                            await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
+                    elif api_key_count > 1:
+                        rate_limit_cooling_time = _get_rate_limit_cooling_time(provider, status_code, error_message)
+                        if rate_limit_cooling_time > 0:
+                            await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=rate_limit_cooling_time)
+                        else:
+                            cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
+                            if int(cooling_time) > 0:
+                                await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
 
                 logger.error(f"/v1/responses upstream error {status_code} with provider {channel_id} api_key: {provider_api_key_raw}: {error_message}")
 

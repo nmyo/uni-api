@@ -94,6 +94,33 @@ class DummyClientManager:
         yield DummyClient(self.response, self.stream_calls, self.post_calls)
 
 
+class SequencedDummyClient:
+    def __init__(self, responses, post_calls):
+        self.responses = responses
+        self.post_calls = post_calls
+
+    async def post(self, url, headers=None, content=None, timeout=None):
+        self.post_calls.append(
+            {
+                "url": url,
+                "headers": headers,
+                "content": content,
+                "timeout": timeout,
+            }
+        )
+        return self.responses.pop(0)
+
+
+class SequencedDummyClientManager:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.post_calls = []
+
+    @asynccontextmanager
+    async def get_client(self, base_url, proxy=None, http2=None):
+        yield SequencedDummyClient(self.responses, self.post_calls)
+
+
 class DummyStreamingUpstreamResponse:
     def __init__(self, *, chunks=None, stream_error=None, status_code=200, json_data=None, raw_body=None):
         self.status_code = status_code
@@ -802,6 +829,96 @@ def test_responses_non_stream_retries_next_provider_on_semantic_failure(monkeypa
         "https://provider-a.example/v1/responses",
         "https://provider-b.example/v1/responses",
     ]
+
+
+def test_responses_non_stream_rate_limit_cools_current_key_and_tries_next_key(monkeypatch):
+    provider_name = "codex-provider"
+    keys = main.ThreadSafeCircularList(
+        ["key-1", "key-2"],
+        schedule_algorithm="fixed_priority",
+        provider_name=provider_name,
+    )
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, keys)
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://example.com/v1/responses",
+                "api": ["key-1", "key-2"],
+                "preferences": {"api_key_rate_limit_cooldown_period": 1},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
+    monkeypatch.setattr(main, "_split_codex_api_key", lambda raw: ("account-1", "refresh-1"))
+
+    async def fake_get_codex_access_token(provider_name, provider_api_key_raw, proxy):
+        return provider_api_key_raw
+
+    monkeypatch.setattr(main, "_get_codex_access_token", fake_get_codex_access_token)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = SequencedDummyClientManager(
+        [
+            httpx.Response(
+                429,
+                request=httpx.Request("POST", "https://example.com/v1/responses"),
+                json={
+                    "error": {
+                        "type": "tokens",
+                        "code": "rate_limit_exceeded",
+                        "message": "Rate limit reached for gpt-5.4 on tokens per min (TPM): Limit 40000000, Used 40000000, Requested 72349. Please try again in 108ms.",
+                    }
+                },
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://example.com/v1/responses"),
+                json={
+                    "id": "resp-b",
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "hello-b",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ),
+        ]
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["id"] == "resp-b"
+    assert [call["headers"]["Authorization"] for call in main.app.state.client_manager.post_calls] == [
+        "Bearer key-1",
+        "Bearer key-2",
+    ]
+    assert keys.cooling_until["key-1"] > 0
 
 
 def test_responses_non_stream_semantic_bad_request_does_not_retry(monkeypatch):
