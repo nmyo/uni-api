@@ -171,7 +171,7 @@ def _configure_responses_test(monkeypatch, *, engine, provider_preferences=None)
     return client_manager
 
 
-def _run_responses_request(request):
+def _run_responses_request(request, *, endpoint="/v1/responses"):
     request_token = main.request_info.set(
         {
             "request_id": "req-test",
@@ -187,6 +187,7 @@ def _run_responses_request(request):
                 request_data=request,
                 api_index=0,
                 background_tasks=BackgroundTasks(),
+                endpoint=endpoint,
             )
         )
     finally:
@@ -335,6 +336,29 @@ def test_responses_codex_strips_response_format(monkeypatch):
     assert len(client_manager.post_calls) == 1
     sent_payload = json.loads(client_manager.post_calls[0]["content"])
     assert "response_format" not in sent_payload
+
+
+def test_responses_compact_codex_strips_store(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={"post_body_parameter_overrides": {"store": False}},
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            store=False,
+        ),
+        endpoint="/v1/responses/compact",
+    )
+
+    assert response.status_code == 200
+    assert len(client_manager.post_calls) == 1
+    assert client_manager.post_calls[0]["url"] == "https://example.com/v1/responses/compact"
+    sent_payload = json.loads(client_manager.post_calls[0]["content"])
+    assert "store" not in sent_payload
 
 
 def test_responses_gpt_keeps_max_output_tokens(monkeypatch):

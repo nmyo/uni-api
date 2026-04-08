@@ -2487,7 +2487,7 @@ class ResponsesRequestHandler:
             )
 
             if engine == "codex":
-                strip_unsupported_codex_payload_fields(payload)
+                strip_unsupported_codex_payload_fields(payload, strip_store=wants_compact)
 
             channel_id = f"{provider_name}"
             logger.info(f"provider: {channel_id[:11]:<11} model: {request_model_name:<22} engine: {engine[:13]:<13} role: {role}")
