@@ -279,6 +279,74 @@ async def wait_for_timeout(wait_for_thing, timeout = 3, wait_task=None):
     else:
         return first_response_task, "timeout"
 
+def _infer_openai_like_error_status(error_obj, default_status=500):
+    if not isinstance(error_obj, dict):
+        return default_status
+
+    raw_status = error_obj.get("status_code") or error_obj.get("status")
+    try:
+        status_code = int(raw_status)
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code is not None and 100 <= status_code <= 599:
+        return status_code
+
+    error_code = str(error_obj.get("code") or "").strip().lower()
+    if error_code in {
+        "rate_limit_exceeded",
+        "billing_hard_limit_reached",
+        "insufficient_quota",
+    }:
+        return 429
+    if error_code in {
+        "invalid_api_key",
+        "incorrect_api_key_provided",
+        "authentication_error",
+    }:
+        return 401
+    if error_code in {
+        "permission_denied",
+    }:
+        return 403
+    if error_code in {
+        "invalid_request_error",
+        "invalid_type",
+        "unsupported_parameter",
+        "context_length_exceeded",
+    }:
+        return 400
+    if error_code in {
+        "model_not_found",
+        "not_found_error",
+    }:
+        return 404
+
+    error_type = str(error_obj.get("type") or "").strip().lower()
+    if error_type in {"tokens", "rate_limit_error"}:
+        return 429
+    if error_type == "authentication_error":
+        return 401
+    if error_type == "permission_error":
+        return 403
+    if error_type == "invalid_request_error":
+        return 400
+    if error_type == "not_found_error":
+        return 404
+
+    message = str(error_obj.get("message") or "").lower()
+    if "rate limit" in message or "too many requests" in message:
+        return 429
+    if "invalid" in message or "unsupported" in message:
+        return 400
+    if "not found" in message:
+        return 404
+    if "permission" in message or "forbidden" in message:
+        return 403
+    if "auth" in message or "api key" in message or "unauthorized" in message:
+        return 401
+
+    return default_status
+
 async def error_handling_wrapper(generator, channel_id, engine, stream, error_triggers, keepalive_interval=None, last_message_role=None):
 
     async def new_generator(first_item=None, with_keepalive=False, wait_task=None, timeout=3):
@@ -381,13 +449,16 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
 
         if isinstance(first_item_str, dict) and 'error' in first_item_str and first_item_str.get('error') != {"message": "","type": "","param": "","code": None}:
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
-            status_code = first_item_str.get('status_code', 500)
+            status_code = first_item_str.get('status_code') or _infer_openai_like_error_status(first_item_str.get('error'), default_status=500)
             detail = first_item_str.get('details', f"{first_item_str}")
             raise HTTPException(status_code=status_code, detail=f"{detail}"[:1000])
 
         if isinstance(first_item_str, dict) and safe_get(first_item_str, "choices", 0, "error", default=None):
             # 如果第一个 yield 的项是错误信息，抛出 HTTPException
-            status_code = safe_get(first_item_str, "choices", 0, "error", "code", default=500)
+            status_code = _infer_openai_like_error_status(
+                safe_get(first_item_str, "choices", 0, "error", default={}) or {},
+                default_status=500,
+            )
             detail = safe_get(first_item_str, "choices", 0, "error", "message", default=f"{first_item_str}")
             raise HTTPException(status_code=status_code, detail=f"{detail}"[:1000])
 

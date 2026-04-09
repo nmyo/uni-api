@@ -2121,19 +2121,19 @@ def _get_rate_limit_cooling_time(provider: dict, status_code: int, details: Any)
         provider,
         "preferences",
         "api_key_rate_limit_cooldown_period",
-        default=safe_get(provider, "preferences", "api_key_cooldown_period", default=60),
+        default=30 * 60,
     )
     try:
         configured_seconds = int(configured)
     except Exception:
-        configured_seconds = 60
+        configured_seconds = 30 * 60
 
     retry_after_seconds = _extract_retry_after_seconds(details)
     if configured_seconds > 0:
         return max(configured_seconds, retry_after_seconds)
     if retry_after_seconds > 0:
         return retry_after_seconds
-    return 60
+    return 30 * 60
 
 def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
     if status_code not in (401, 403, 402):
