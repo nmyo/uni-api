@@ -119,6 +119,7 @@ providers:
       #   gemini-2.5-pro: 5/min,25/day,1048576/tpr # 1048576/tpr 表示每次请求的 tokens 数量限制为 1048576 个 tokens
       #   default: 4/min # 如果模型没有设置频率限制，使用 default 的频率限制
       api_key_cooldown_period: 60 # 每个 API Key 遭遇 429 错误后的冷却时间，单位为秒，选填。默认为 0 秒, 当设置为 0 秒时，不启用冷却机制。当存在多个 API key 时才会生效。
+      api_key_server_error_cooldown_period: 60 # /v1/responses/compact 使用 codex 上游时，如果某个 API Key 在响应真正输出前遭遇 5xx / 网络类上游错误，将该 key 冷却指定秒数，便于 fixed_priority 立即切换到下一把 key。选填，默认 60 秒；设置为 0 可关闭。
       api_key_schedule_algorithm: round_robin # 设置多个 API Key 的请求顺序，选填。默认为 round_robin，可选值有：round_robin，random，fixed_priority，smart_round_robin。当存在多个 API key 时才会生效。round_robin 是轮询负载均衡，random 是随机负载均衡，fixed_priority 是固定优先级调度，永远使用第一个可用的 API key。smart_round_robin 是一个基于历史成功率的智能调度算法，详见 FAQ 部分。
       model_timeout: # 模型超时时间，单位为秒，默认 100 秒，选填
         gemini-2.5-pro: 500 # 模型 gemini-2.5-pro 的超时时间为 500 秒

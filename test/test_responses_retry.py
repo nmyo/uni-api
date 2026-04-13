@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -33,6 +33,33 @@ class DummyCircularList:
 
     async def set_cooling(self, item, cooling_time):
         self.cooling_calls.append((item, cooling_time))
+
+
+class FixedPriorityCoolingDummyList:
+    def __init__(self, items):
+        self.items = list(items)
+        self.next_calls = []
+        self.cooling_calls = []
+        self.cooled_items = set()
+
+    async def is_all_rate_limited(self, model):
+        _ = model
+        return len(self.cooled_items) >= len(self.items)
+
+    async def next(self, model):
+        for item in self.items:
+            if item in self.cooled_items:
+                continue
+            self.next_calls.append((model, item))
+            return item
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    def get_items_count(self):
+        return len(self.items)
+
+    async def set_cooling(self, item, cooling_time):
+        self.cooling_calls.append((item, cooling_time))
+        self.cooled_items.add(item)
 
 
 class DummyStreamContext:
@@ -452,6 +479,136 @@ def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatc
     assert any("/v1/responses/compact upstream error status=404" in log for log in error_logs)
     assert any("request_id=req-test" in log for log in error_logs)
     assert any("upstream_url=https://provider-a.example/v1/responses/compact" in log for log in error_logs)
+
+
+def test_responses_compact_codex_server_error_cools_key_and_retries_next_key(monkeypatch):
+    provider_name = "codex-provider"
+    keys = FixedPriorityCoolingDummyList(["key-1", "key-2"])
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, keys)
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-1", "key-2"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
+    monkeypatch.setattr(main, "_split_codex_api_key", lambda raw: ("account-1", "refresh-1"))
+
+    async def fake_get_codex_access_token(provider_name, provider_api_key_raw, proxy):
+        _ = provider_name, proxy
+        return f"access-for-{provider_api_key_raw}"
+
+    monkeypatch.setattr(main, "_get_codex_access_token", fake_get_codex_access_token)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = SequencedDummyClientManager(
+        [
+            httpx.Response(
+                500,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses/compact"),
+                text="",
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses/compact"),
+                json={"ok": True, "provider_api_key": "key-2"},
+            ),
+        ]
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        ),
+        endpoint="/v1/responses/compact",
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"ok": True, "provider_api_key": "key-2"}
+    assert keys.next_calls == [("gpt-5.4", "key-1"), ("gpt-5.4", "key-2")]
+    assert keys.cooling_calls == [("key-1", 60)]
+
+
+def test_responses_non_compact_codex_server_error_does_not_cool_key_by_default(monkeypatch):
+    provider_name = "codex-provider"
+    keys = FixedPriorityCoolingDummyList(["key-1", "key-2"])
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, keys)
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-1", "key-2"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
+    monkeypatch.setattr(main, "_split_codex_api_key", lambda raw: ("account-1", "refresh-1"))
+
+    async def fake_get_codex_access_token(provider_name, provider_api_key_raw, proxy):
+        _ = provider_name, proxy
+        return f"access-for-{provider_api_key_raw}"
+
+    monkeypatch.setattr(main, "_get_codex_access_token", fake_get_codex_access_token)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = SequencedDummyClientManager(
+        [
+            httpx.Response(
+                500,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
+                text="",
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses"),
+                json={"ok": True, "provider_api_key": "key-1"},
+            ),
+        ]
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        ),
+        endpoint="/v1/responses",
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"ok": True, "provider_api_key": "key-1"}
+    assert keys.next_calls == [("gpt-5.4", "key-1"), ("gpt-5.4", "key-1")]
+    assert keys.cooling_calls == []
 
 
 def test_responses_gpt_keeps_max_output_tokens(monkeypatch):
