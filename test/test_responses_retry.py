@@ -221,7 +221,7 @@ def _run_responses_request(request, *, endpoint="/v1/responses"):
         main.request_info.reset(request_token)
 
 
-def _run_responses_request_with_stream_body(request):
+def _run_responses_request_with_stream_body(request, *, endpoint="/v1/responses"):
     request_token = main.request_info.set(
         {
             "request_id": "req-test",
@@ -237,6 +237,7 @@ def _run_responses_request_with_stream_body(request):
             request_data=request,
             api_index=0,
             background_tasks=BackgroundTasks(),
+            endpoint=endpoint,
         )
 
         body = ""
@@ -386,6 +387,71 @@ def test_responses_compact_codex_strips_store(monkeypatch):
     assert client_manager.post_calls[0]["url"] == "https://example.com/v1/responses/compact"
     sent_payload = json.loads(client_manager.post_calls[0]["content"])
     assert "store" not in sent_payload
+
+
+def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatch):
+    provider_name = "provider-a"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    error_logs = []
+
+    def fake_error(msg, *args, **kwargs):
+        _ = kwargs
+        error_logs.append(msg % args if args else msg)
+
+    monkeypatch.setattr(main.logger, "error", fake_error)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://provider-a.example/v1/responses/compact": httpx.Response(
+                404,
+                request=httpx.Request("POST", "https://provider-a.example/v1/responses/compact"),
+                json={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Invalid URL (POST /v1/responses/compact)",
+                    }
+                },
+            )
+        }
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        ),
+        endpoint="/v1/responses/compact",
+    )
+
+    assert response.status_code == 404
+    assert any("/v1/responses/compact upstream error status=404" in log for log in error_logs)
+    assert any("request_id=req-test" in log for log in error_logs)
+    assert any("upstream_url=https://provider-a.example/v1/responses/compact" in log for log in error_logs)
 
 
 def test_responses_gpt_keeps_max_output_tokens(monkeypatch):
@@ -741,6 +807,76 @@ def test_responses_stream_does_not_retry_after_output_started(monkeypatch):
     assert [call["url"] for call in main.app.state.client_manager.stream_calls] == [
         "https://provider-a.example/v1/responses",
     ]
+
+
+def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
+    provider_name = "provider-a"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList(["key-a"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/v1/responses",
+                "api": ["key-a"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    warning_logs = []
+
+    def fake_warning(msg, *args, **kwargs):
+        _ = kwargs
+        warning_logs.append(msg % args if args else msg)
+
+    monkeypatch.setattr(main.logger, "warning", fake_warning)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://provider-a.example/v1/responses/compact": DummyStreamingUpstreamResponse(
+                chunks=[
+                    _responses_sse("response.created", {"type": "response.created", "provider": "a"}),
+                    _responses_sse("response.in_progress", {"type": "response.in_progress", "provider": "a"}),
+                    _responses_sse("response.output_text.delta", {"type": "response.output_text.delta", "delta": "hello-a"}),
+                ],
+                stream_error=httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body",
+                    request=httpx.Request("POST", "https://provider-a.example/v1/responses/compact"),
+                ),
+            )
+        }
+    )
+
+    response, body = _run_responses_request_with_stream_body(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+            stream=True,
+        ),
+        endpoint="/v1/responses/compact",
+    )
+
+    assert response.status_code == 200
+    assert "hello-a" in body
+    assert body.endswith("data: [DONE]\n\n")
+    assert any("/v1/responses/compact upstream stream aborted stage=post-commit" in log for log in warning_logs)
+    assert any("error_type=RemoteProtocolError" in log for log in warning_logs)
+    assert any("request_id=req-test" in log for log in warning_logs)
+    assert any("upstream_url=https://provider-a.example/v1/responses/compact" in log for log in warning_logs)
 
 
 def test_responses_non_stream_retries_next_provider_on_semantic_failure(monkeypatch):

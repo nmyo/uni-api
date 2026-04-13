@@ -2233,6 +2233,30 @@ def _compute_retry_count(matching_providers: list[dict]) -> int:
     tmp_retry_count = sum(provider_api_circular_list[p["provider"]].get_items_count() for p in matching_providers) * 2
     return tmp_retry_count if tmp_retry_count < 10 else 10
 
+def _responses_request_id(current_info: Any) -> str:
+    if isinstance(current_info, dict):
+        request_id = current_info.get("request_id")
+        if request_id:
+            return str(request_id)
+    return "-"
+
+def _log_responses_downstream_disconnect(
+    endpoint: str,
+    current_info: Any,
+    *,
+    model_id: str,
+    provider_name: Optional[str] = None,
+    stage: str,
+) -> None:
+    logger.info(
+        "%s downstream disconnect stage=%s request_id=%s model=%s provider=%s",
+        endpoint,
+        stage,
+        _responses_request_id(current_info),
+        model_id,
+        provider_name or "-",
+    )
+
 def _build_upstream_error_response(status_code: int, error_message: Any, fallback_prefix: Optional[str] = None) -> JSONResponse:
     parsed_error = None
     if isinstance(error_message, (dict, list)):
@@ -2457,6 +2481,7 @@ class ResponsesRequestHandler:
 
         current_info = request_info.get()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
+        request_id = _responses_request_id(current_info)
 
         role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
         scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
@@ -2480,6 +2505,12 @@ class ResponsesRequestHandler:
         index = 0
         while True:
             if disconnect_event is not None and disconnect_event.is_set():
+                _log_responses_downstream_disconnect(
+                    endpoint,
+                    current_info,
+                    model_id=request_model_name,
+                    stage="before-provider-select",
+                )
                 return Response(content="", status_code=499)
 
             if index > num_matching_providers + retry_count:
@@ -2546,7 +2577,16 @@ class ResponsesRequestHandler:
                 except ValueError as e:
                     status_code = 500
                     error_message = str(e)
-                    logger.error(f"/v1/responses invalid codex api key with provider {provider_name}: {provider_api_key_raw}: {error_message}")
+                    logger.error(
+                        "%s invalid codex api key request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                        endpoint,
+                        request_id,
+                        request_model_name,
+                        provider_name,
+                        provider_api_key_raw,
+                        upstream_url,
+                        error_message,
+                    )
                     if not auto_retry:
                         break
                     continue
@@ -2555,7 +2595,16 @@ class ResponsesRequestHandler:
                 except HTTPException as e:
                     status_code = getattr(e, "status_code", 401)
                     error_message = str(getattr(e, "detail", "")) or str(e)
-                    logger.error(f"/v1/responses codex token refresh failed with provider {provider_name}: {provider_api_key_raw}: {error_message}")
+                    logger.error(
+                        "%s codex token refresh failed request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                        endpoint,
+                        request_id,
+                        request_model_name,
+                        provider_name,
+                        provider_api_key_raw,
+                        upstream_url,
+                        error_message,
+                    )
                     # If a Codex refresh_token is invalid/reused, treat it as a dead key and cool it down
                     # so fixed_priority schedules can fall back to the next key immediately.
                     if provider_api_key_raw and provider_name and not provider_name.startswith("sk-") and status_code in (401, 403):
@@ -2607,7 +2656,16 @@ class ResponsesRequestHandler:
                 strip_unsupported_codex_payload_fields(payload, strip_store=wants_compact)
 
             channel_id = f"{provider_name}"
-            logger.info(f"provider: {channel_id[:11]:<11} model: {request_model_name:<22} engine: {engine[:13]:<13} role: {role}")
+            logger.info(
+                "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
+                endpoint,
+                request_id,
+                channel_id[:11],
+                request_model_name,
+                engine[:13],
+                role,
+                upstream_url,
+            )
 
             try:
                 async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
@@ -2640,26 +2698,54 @@ class ResponsesRequestHandler:
 
                         if disconnect_event is not None and disconnect_event.is_set():
                             await stream_cm.__aexit__(None, None, None)
+                            _log_responses_downstream_disconnect(
+                                endpoint,
+                                current_info,
+                                model_id=request_model_name,
+                                provider_name=provider_name,
+                                stage="before-stream-commit",
+                            )
                             return Response(content="", status_code=499)
 
                         async def proxy_stream():
                             try:
                                 for chunk in buffered_chunks:
                                     if disconnect_event is not None and disconnect_event.is_set():
+                                        _log_responses_downstream_disconnect(
+                                            endpoint,
+                                            current_info,
+                                            model_id=request_model_name,
+                                            provider_name=provider_name,
+                                            stage="after-stream-commit",
+                                        )
                                         return
                                     yield chunk
                                 async for chunk in upstream_iter:
                                     if disconnect_event is not None and disconnect_event.is_set():
+                                        _log_responses_downstream_disconnect(
+                                            endpoint,
+                                            current_info,
+                                            model_id=request_model_name,
+                                            provider_name=provider_name,
+                                            stage="after-stream-commit",
+                                        )
                                         break
                                     yield chunk
                             except RESPONSES_STREAM_NETWORK_ERRORS as e:
                                 # Upstream may occasionally reset an HTTP/2 stream; avoid surfacing it as an ASGI exception.
+                                stream_stage = "post-commit" if stream_committed else "preflight"
+                                error_text = str(e) or type(e).__name__
                                 logger.warning(
-                                    "Upstream stream aborted (%s) provider=%s key=%s: %s",
+                                    "%s upstream stream aborted stage=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                                    endpoint,
+                                    stream_stage,
                                     type(e).__name__,
+                                    request_id,
+                                    request_model_name,
                                     provider_name,
                                     provider_api_key_raw,
-                                    str(e),
+                                    upstream_url,
+                                    error_text,
                                 )
                                 # Once a semantic event has been emitted to the client we can no longer
                                 # switch providers safely, so we terminate the SSE stream cleanly.
@@ -2699,7 +2785,8 @@ class ResponsesRequestHandler:
                 background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=False, provider_api_key=provider_api_key_raw)
 
                 status_code = getattr(e, "status_code", 500)
-                error_message = str(getattr(e, "detail", "")) or str(e)
+                error_type = type(e).__name__
+                error_message = str(getattr(e, "detail", "")) or str(e) or error_type
 
                 is_codex_permanent_auth_failure = (
                     engine == "codex"
@@ -2726,7 +2813,18 @@ class ResponsesRequestHandler:
                             if int(cooling_time) > 0:
                                 await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
 
-                logger.error(f"/v1/responses upstream error {status_code} with provider {channel_id} api_key: {provider_api_key_raw}: {error_message}")
+                logger.error(
+                    "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                    endpoint,
+                    status_code,
+                    error_type,
+                    request_id,
+                    request_model_name,
+                    channel_id,
+                    provider_api_key_raw,
+                    upstream_url,
+                    error_message,
+                )
 
                 should_retry = auto_retry and (
                     status_code not in (400, 413)
