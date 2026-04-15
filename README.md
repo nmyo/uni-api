@@ -119,7 +119,6 @@ providers:
       #   gemini-2.5-pro: 5/min,25/day,1048576/tpr # 1048576/tpr means the token limit per request is 1,048,576 tokens.
       #   default: 4/min # If the model does not set the frequency limit, use the frequency limit of default
       api_key_cooldown_period: 60 # Each API Key will be cooled down for 60 seconds after encountering a 429 error. Optional, the default is 0 seconds. When set to 0, the cooling mechanism is not enabled. When there are multiple API keys, the cooling mechanism will take effect.
-      api_key_server_error_cooldown_period: 60 # Optional. When /v1/responses/compact uses a codex upstream and an API key hits a 5xx or network-style upstream error before the response is committed, cool that key for N seconds so fixed_priority can fail over to the next key. Defaults to 60 seconds; set to 0 to disable.
       api_key_schedule_algorithm: round_robin # Set the request order of multiple API Keys, optional. The default is round_robin, and the optional values are: round_robin, random, fixed_priority, smart_round_robin. It will take effect when there are multiple API keys. round_robin is polling load balancing, and random is random load balancing. fixed_priority is fixed priority scheduling, always use the first available API key. `smart_round_robin` is an intelligent scheduling algorithm based on historical success rates, see FAQ for details.
       model_timeout: # Model timeout, in seconds, default 100 seconds, optional
         gemini-2.5-pro: 500 # Model gemini-2.5-pro timeout is 500 seconds

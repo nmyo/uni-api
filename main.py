@@ -2135,37 +2135,6 @@ def _get_rate_limit_cooling_time(provider: dict, status_code: int, details: Any)
         return retry_after_seconds
     return 30 * 60
 
-def _get_compact_codex_server_error_cooling_time(
-    provider: dict,
-    *,
-    endpoint: str,
-    engine: str,
-    status_code: int,
-    details: Any,
-) -> int:
-    if engine != "codex":
-        return 0
-    if not endpoint.rstrip("/").endswith("/compact"):
-        return 0
-    if status_code < 500:
-        return 0
-    if _is_quota_exhausted_error(status_code, str(details or "")):
-        return 0
-    if _is_retryable_rate_limit_error(status_code, details):
-        return 0
-
-    configured = safe_get(provider, "preferences", "api_key_server_error_cooldown_period", default=None)
-    if configured is None:
-        configured = safe_get(provider, "preferences", "api_key_cooldown_period", default=None)
-
-    default_seconds = 60
-    try:
-        cooling_seconds = default_seconds if configured is None else int(configured)
-    except Exception:
-        cooling_seconds = default_seconds
-
-    return max(0, cooling_seconds)
-
 def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
     if status_code not in (401, 403, 402):
         return False
@@ -2840,15 +2809,7 @@ class ResponsesRequestHandler:
                         if rate_limit_cooling_time > 0:
                             await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=rate_limit_cooling_time)
                         else:
-                            cooling_time = _get_compact_codex_server_error_cooling_time(
-                                provider,
-                                endpoint=endpoint,
-                                engine=engine,
-                                status_code=status_code,
-                                details=error_message,
-                            )
-                            if cooling_time <= 0:
-                                cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
+                            cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
                             if int(cooling_time) > 0:
                                 await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
 
