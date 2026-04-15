@@ -259,6 +259,54 @@ def _run_responses_request_with_stream_body(request, *, endpoint="/v1/responses"
         main.request_info.reset(request_token)
 
 
+def test_resolve_codex_upstream_auth_passes_through_plain_bearer(monkeypatch):
+    called = False
+
+    async def fake_get_codex_access_token(provider_name, provider_api_key_raw, proxy):
+        nonlocal called
+        _ = provider_name, provider_api_key_raw, proxy
+        called = True
+        return "should-not-run"
+
+    monkeypatch.setattr(main, "_get_codex_access_token", fake_get_codex_access_token)
+
+    api_key, account_id = asyncio.run(
+        main._resolve_codex_upstream_auth("codex-provider", "change-me", None)
+    )
+
+    assert api_key == "change-me"
+    assert account_id is None
+    assert called is False
+
+
+def test_resolve_codex_upstream_auth_uses_oauth_for_account_refresh_format(monkeypatch):
+    seen = {}
+
+    async def fake_get_codex_access_token(provider_name, provider_api_key_raw, proxy):
+        seen["provider_name"] = provider_name
+        seen["provider_api_key_raw"] = provider_api_key_raw
+        seen["proxy"] = proxy
+        return "codex-access-token"
+
+    monkeypatch.setattr(main, "_get_codex_access_token", fake_get_codex_access_token)
+
+    api_key, account_id = asyncio.run(
+        main._resolve_codex_upstream_auth(
+            "codex-provider",
+            "account-1,refresh-1",
+            "http://proxy.example",
+        )
+    )
+
+    assert api_key == "codex-access-token"
+    assert account_id == "account-1"
+    assert seen == {
+        "provider_name": "codex-provider",
+        "provider_api_key_raw": "account-1,refresh-1",
+        "proxy": "http://proxy.example",
+    }
+
+
 def test_responses_bad_request_does_not_retry_all_keys(monkeypatch):
     provider_name = "codex-like-provider"
     keys = DummyCircularList(["key-1", "key-2", "key-3"])
@@ -578,6 +626,60 @@ def test_responses_codex_generic_post_body_overrides_apply(monkeypatch):
     assert response.status_code == 200
     sent_payload = json.loads(client_manager.post_calls[0]["content"])
     assert sent_payload["store"] is True
+
+
+def test_responses_codex_plain_bearer_api_key_skips_oauth(monkeypatch):
+    provider_name = "codex-provider"
+    keys = DummyCircularList(["change-me"])
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, keys)
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://example.com/v1/responses",
+                "api": ["change-me"],
+                "preferences": {},
+            }
+        ]
+
+    async def fail_get_codex_access_token(provider_name, provider_api_key_raw, proxy):
+        raise AssertionError("direct bearer codex auth should not refresh tokens")
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
+    monkeypatch.setattr(main, "_get_codex_access_token", fail_get_codex_access_token)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://example.com/v1/responses"),
+            json={"id": "resp-plain-bearer", "status": "completed"},
+        )
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    sent_headers = main.app.state.client_manager.post_calls[0]["headers"]
+    assert sent_headers["Authorization"] == "Bearer change-me"
+    assert "Chatgpt-Account-Id" not in sent_headers
 
 
 def test_responses_stream_retries_next_provider_before_output(monkeypatch):
@@ -1086,6 +1188,119 @@ def test_responses_non_stream_rate_limit_cools_current_key_and_tries_next_key(mo
         "Bearer key-2",
     ]
     assert keys.cooling_until["key-1"] > 0
+
+
+def test_responses_prepare_validation_failure_retries_next_provider(monkeypatch):
+    provider_a = "provider-a"
+    provider_b = "provider-b"
+    monkeypatch.setitem(main.provider_api_circular_list, provider_a, DummyCircularList(["key-a"]))
+    monkeypatch.setitem(main.provider_api_circular_list, provider_b, DummyCircularList(["key-b"]))
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_a,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-a.example/chat/completions",
+                "api": ["key-a"],
+                "preferences": {},
+            },
+            {
+                "provider": provider_b,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://provider-b.example/v1/responses",
+                "api": ["key-b"],
+                "preferences": {},
+            },
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("gpt", None))
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        {
+            "https://provider-b.example/v1/responses": httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://provider-b.example/v1/responses"),
+                json={"id": "resp-b", "status": "completed"},
+            )
+        }
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["id"] == "resp-b"
+    assert [call["url"] for call in main.app.state.client_manager.post_calls] == [
+        "https://provider-b.example/v1/responses",
+    ]
+
+
+def test_responses_codex_prepare_failure_does_not_cool_key(monkeypatch):
+    provider_name = "codex-provider"
+    keys = DummyCircularList(["account-1,bad-key-1", "account-2,bad-key-2"])
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, keys)
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "base_url": "https://example.com/v1/responses",
+                "api": ["account-1,bad-key-1", "account-2,bad-key-2"],
+                "preferences": {"api_key_cooldown_period": 60},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "get_engine", lambda provider, endpoint=None, original_model=None: ("codex", None))
+    monkeypatch.setattr(main, "_split_codex_api_key", lambda raw: (_ for _ in ()).throw(ValueError("bad codex key")))
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.4"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = DummyClientManager(
+        httpx.Response(
+            200,
+            request=httpx.Request("POST", "https://example.com/v1/responses"),
+            json={"ok": True},
+        )
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 500
+    assert json.loads(response.body) == {"error": "All gpt-5.4 error: bad codex key"}
+    assert keys.cooling_calls == []
+    assert keys.next_calls == [("gpt-5.4", "account-1,bad-key-1")]
+    assert main.app.state.client_manager.post_calls == []
 
 
 def test_responses_non_stream_semantic_bad_request_does_not_retry(monkeypatch):

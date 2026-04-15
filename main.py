@@ -1,13 +1,11 @@
 import os
 import io
 import re
-import math
 import json
 import uuid
 import codecs
 import httpx
 import string
-import random
 import secrets
 import tomllib
 import asyncio
@@ -45,12 +43,22 @@ from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, 
 from core.utils import (
     get_proxy,
     get_engine,
-    get_model_dict,
     parse_rate_limit,
-    circular_list_encoder,
     collect_openai_chat_completion_from_streaming_sse,
     ThreadSafeCircularList,
     provider_api_circular_list,
+)
+from routing import (
+    RoutingPlan,
+    build_api_key_models_map,
+    estimate_request_total_tokens,
+    get_right_order_providers,
+    select_provider_api_key_raw,
+)
+from upstream import (
+    UPSTREAM_NETWORK_ERRORS,
+    UpstreamRunner,
+    build_upstream_error_response,
 )
 
 from utils import (
@@ -158,6 +166,68 @@ def init_preference(all_config, preference_key, default_timeout=DEFAULT_TIMEOUT)
 
     return result
 
+
+def _build_user_api_keys_rate_limit(config: dict, api_list: list[str]) -> defaultdict:
+    user_api_keys_rate_limit = defaultdict(ThreadSafeCircularList)
+    for api_index, api_key in enumerate(api_list):
+        user_api_keys_rate_limit[api_key] = ThreadSafeCircularList(
+            [api_key],
+            safe_get(config, "api_keys", api_index, "preferences", "rate_limit", default={"default": "999999/min"}),
+            "round_robin",
+        )
+    return user_api_keys_rate_limit
+
+
+def _build_admin_api_keys(api_keys_db: list[dict]) -> list[str]:
+    admin_api_key = []
+    for item in api_keys_db:
+        if "admin" in item.get("role", ""):
+            admin_api_key.append(item.get("api"))
+    if admin_api_key:
+        return admin_api_key
+    if api_keys_db:
+        return [api_keys_db[0].get("api")]
+
+    from utils import yaml_error_message
+
+    if yaml_error_message:
+        raise HTTPException(
+            status_code=500,
+            detail={"error": yaml_error_message},
+        )
+    raise HTTPException(
+        status_code=500,
+        detail={"error": "No API key found in api.yaml"},
+    )
+
+
+async def refresh_runtime_state(app: FastAPI) -> None:
+    config = getattr(app.state, "config", {}) or {}
+    api_keys_db = getattr(app.state, "api_keys_db", []) or []
+    api_list = getattr(app.state, "api_list", []) or []
+
+    app.state.user_api_keys_rate_limit = _build_user_api_keys_rate_limit(config, api_list)
+    app.state.global_rate_limit = parse_rate_limit(
+        safe_get(config, "preferences", "rate_limit", default="999999/min")
+    )
+    app.state.admin_api_key = _build_admin_api_keys(api_keys_db)
+    app.state.provider_timeouts = init_preference(config, "model_timeout", DEFAULT_TIMEOUT)
+    app.state.keepalive_interval = init_preference(config, "keepalive_interval", 99999)
+    app.state.models_list = build_api_key_models_map(config, api_list)
+
+    if not DISABLE_DATABASE:
+        app.state.paid_api_keys_states = {}
+        for paid_key in api_list:
+            await update_paid_api_keys_states(app, paid_key)
+
+
+def get_runtime_api_list() -> list[str]:
+    runtime_api_list = getattr(app.state, "api_list", None)
+    if runtime_api_list:
+        return runtime_api_list
+    config = getattr(app.state, "config", {}) or {}
+    return [item.get("api") for item in config.get("api_keys", []) if item.get("api")]
+
 def get_current_model_prices(model_name: str):
     """
     根据当前配置偏好，返回指定模型的 prompt_price 和 completion_price（单位：$/M tokens）
@@ -248,46 +318,7 @@ async def lifespan(app: FastAPI):
         #     raise TypeError
         # print("app.state.config", json.dumps(app.state.config, indent=4, ensure_ascii=False, default=json_default))
 
-        if app.state.api_list:
-            app.state.user_api_keys_rate_limit = defaultdict(ThreadSafeCircularList)
-            for api_index, api_key in enumerate(app.state.api_list):
-                app.state.user_api_keys_rate_limit[api_key] = ThreadSafeCircularList(
-                    [api_key],
-                    safe_get(app.state.config, 'api_keys', api_index, "preferences", "rate_limit", default={"default": "999999/min"}),
-                    "round_robin"
-                )
-        app.state.global_rate_limit = parse_rate_limit(safe_get(app.state.config, "preferences", "rate_limit", default="999999/min"))
-
-        app.state.admin_api_key = []
-        for item in app.state.api_keys_db:
-            if "admin" in item.get("role", ""):
-                app.state.admin_api_key.append(item.get("api"))
-        if app.state.admin_api_key == []:
-            if len(app.state.api_keys_db) >= 1:
-                app.state.admin_api_key = [app.state.api_keys_db[0].get("api")]
-            else:
-                from utils import yaml_error_message
-                if yaml_error_message:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={"error": yaml_error_message}
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=500,
-                        detail={"error": "No API key found in api.yaml"}
-                    )
-
-        app.state.provider_timeouts = init_preference(app.state.config, "model_timeout", DEFAULT_TIMEOUT)
-        app.state.keepalive_interval = init_preference(app.state.config, "keepalive_interval", 99999)
-        # pprint(dict(app.state.provider_timeouts))
-        # pprint(dict(app.state.keepalive_interval))
-        # print("app.state.provider_timeouts", app.state.provider_timeouts)
-        # print("app.state.keepalive_interval", app.state.keepalive_interval)
-        if not DISABLE_DATABASE:
-            app.state.paid_api_keys_states = {}
-            for paid_key in app.state.api_list:
-                await update_paid_api_keys_states(app, paid_key)
+        await refresh_runtime_state(app)
 
     if app and not hasattr(app.state, 'client_manager'):
 
@@ -947,47 +978,20 @@ app.add_middleware(StatsMiddleware)
 @app.middleware("http")
 async def ensure_config(request: Request, call_next):
     if app and app.state.api_keys_db and not hasattr(app.state, "models_list"):
-        app.state.models_list = {}
-        for item in app.state.api_keys_db:
-            api_key_model_list = item.get("model", [])
-            for provider_rule in api_key_model_list:
-                provider_name = provider_rule.split("/")[0]
-                if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-                    models_list = []
-                    try:
-                        # 构建请求头
-                        headers = {
-                            "Authorization": f"Bearer {provider_name}"
-                        }
-                        # 发送GET请求获取模型列表
-                        base_url = "http://127.0.0.1:8000/v1/models"
-                        async with app.state.client_manager.get_client(base_url) as client:
-                            response = await client.get(
-                                base_url,
-                                headers=headers
-                            )
-                            if response.status_code == 200:
-                                models_data = response.json()
-                                # 将获取到的模型添加到models_list
-                                for model in models_data.get("data", []):
-                                    models_list.append(model["id"])
-                    except Exception as e:
-                        if str(e):
-                            logger.error(f"获取模型列表失败: {str(e)}")
-                    app.state.models_list[provider_name] = models_list
+        app.state.models_list = build_api_key_models_map(app.state.config, app.state.api_list)
     return await call_next(request)
 
 class ClientManager:
     def __init__(self, pool_size=100):
         self.pool_size = pool_size
         self.clients = {}  # {host_timeout_proxy: AsyncClient}
+        self._client_locks = defaultdict(asyncio.Lock)
 
     async def init(self, default_config):
         self.default_config = default_config
 
     @asynccontextmanager
     async def get_client(self, base_url, proxy=None, http2: Optional[bool] = None):
-        # 直接获取或创建客户端,不使用锁
         # 从base_url中提取主机名
         parsed_url = urlparse(base_url)
         host = parsed_url.netloc
@@ -1002,25 +1006,27 @@ class ClientManager:
             client_key += f"_http2_{int(bool(http2))}"
 
         if client_key not in self.clients:
-            timeout = httpx.Timeout(
-                connect=15.0,
-                read=None,  # 为单个请求设置超时
-                write=30.0,
-                pool=self.pool_size
-            )
-            limits = httpx.Limits(max_connections=self.pool_size)
+            async with self._client_locks[client_key]:
+                if client_key not in self.clients:
+                    timeout = httpx.Timeout(
+                        connect=15.0,
+                        read=None,
+                        write=30.0,
+                        pool=self.pool_size,
+                    )
+                    limits = httpx.Limits(max_connections=self.pool_size)
 
-            client_config = {
-                **self.default_config,
-                "timeout": timeout,
-                "limits": limits
-            }
+                    client_config = {
+                        **self.default_config,
+                        "timeout": timeout,
+                        "limits": limits,
+                    }
 
-            client_config = get_proxy(proxy, client_config)
-            if http2 is not None:
-                client_config["http2"] = bool(http2)
+                    client_config = get_proxy(proxy, client_config)
+                    if http2 is not None:
+                        client_config["http2"] = bool(http2)
 
-            self.clients[client_key] = httpx.AsyncClient(**client_config)
+                    self.clients[client_key] = httpx.AsyncClient(**client_config)
 
         try:
             yield self.clients[client_key]
@@ -1296,17 +1302,47 @@ async def _get_codex_access_token(provider_name: str, provider_api_key_raw: str,
         await _persist_codex_refresh_token(provider_api_key_raw, updated_refresh_token)
         return str(refreshed["access_token"])
 
+
+async def _resolve_codex_upstream_auth(
+    provider_name: str,
+    provider_api_key_raw: Optional[str],
+    proxy: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    if provider_api_key_raw is None:
+        return None, None
+
+    raw = str(provider_api_key_raw).strip()
+    if not raw:
+        return None, None
+
+    # Support direct Codex-compatible proxies that only need a fixed Bearer token.
+    if "," not in raw:
+        return raw, None
+
+    codex_account_id, _ = _split_codex_api_key(raw)
+    api_key = await _get_codex_access_token(provider_name, raw, proxy)
+    return api_key, codex_account_id
+
 # 在 process_request 函数中更新成功和失败计数
-async def process_request(request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest], provider: Dict, background_tasks: BackgroundTasks, endpoint=None, role=None, timeout_value=DEFAULT_TIMEOUT, keepalive_interval=None):
+async def process_request(
+    request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
+    provider: Dict,
+    background_tasks: BackgroundTasks,
+    endpoint=None,
+    role=None,
+    timeout_value=DEFAULT_TIMEOUT,
+    keepalive_interval=None,
+    provider_api_key_raw: Optional[str] = None,
+):
     timeout_value = int(timeout_value)
     model_dict = provider["_model_dict_cache"]
     original_model = model_dict[request.model]
-    if provider['provider'].startswith("sk-"):
-        provider_api_key_raw = provider['provider']
-    elif provider.get("api"):
-        provider_api_key_raw = await provider_api_circular_list[provider['provider']].next(original_model)
-    else:
-        provider_api_key_raw = None
+    if provider_api_key_raw is None:
+        provider_api_key_raw = await select_provider_api_key_raw(
+            provider,
+            original_model,
+            get_runtime_api_list(),
+        )
 
     engine, stream_mode = get_engine(provider, endpoint, original_model)
 
@@ -1320,10 +1356,13 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
     codex_account_id = None
     if engine == "codex" and provider_api_key_raw:
         try:
-            codex_account_id, _ = _split_codex_api_key(provider_api_key_raw)
+            api_key, codex_account_id = await _resolve_codex_upstream_auth(
+                provider["provider"],
+                provider_api_key_raw,
+                proxy,
+            )
         except ValueError as e:
             raise HTTPException(status_code=500, detail=str(e))
-        api_key = await _get_codex_access_token(provider['provider'], provider_api_key_raw, proxy)
 
     # Gemini preview TTS returns inline audio; force non-stream so we can return a single OpenAI-style JSON response.
     try:
@@ -1392,290 +1431,6 @@ async def process_request(request: Union[RequestModel, ImageGenerationRequest, A
         background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request.model, current_info["api_key"], success=False, provider_api_key=provider_api_key_raw)
         raise e
 
-def weighted_round_robin(weights):
-    provider_names = list(weights.keys())
-    current_weights = {name: 0 for name in provider_names}
-    num_selections = total_weight = sum(weights.values())
-    weighted_provider_list = []
-
-    for _ in range(num_selections):
-        max_ratio = -1
-        selected_letter = None
-
-        for name in provider_names:
-            current_weights[name] += weights[name]
-            ratio = current_weights[name] / weights[name]
-
-            if ratio > max_ratio:
-                max_ratio = ratio
-                selected_letter = name
-
-        weighted_provider_list.append(selected_letter)
-        current_weights[selected_letter] -= total_weight
-
-    return weighted_provider_list
-
-def lottery_scheduling(weights):
-    total_tickets = sum(weights.values())
-    selections = []
-    for _ in range(total_tickets):
-        ticket = random.randint(1, total_tickets)
-        cumulative = 0
-        for provider, weight in weights.items():
-            cumulative += weight
-            if ticket <= cumulative:
-                selections.append(provider)
-                break
-    return selections
-
-async def get_provider_rules(model_rule, config, request_model):
-    provider_rules = []
-    if model_rule == "all":
-        # 如模型名为 all，则返回所有模型
-        for provider in config["providers"]:
-            model_dict = provider["_model_dict_cache"]
-            for model in model_dict.keys():
-                provider_rules.append(provider["provider"] + "/" + model)
-
-    elif "/" in model_rule:
-        if model_rule.startswith("<") and model_rule.endswith(">"):
-            model_rule = model_rule[1:-1]
-            # 处理带斜杠的模型名
-            for provider in config['providers']:
-                model_dict = provider["_model_dict_cache"]
-                if model_rule in model_dict.keys():
-                    provider_rules.append(provider['provider'] + "/" + model_rule)
-        else:
-            provider_name = model_rule.split("/")[0]
-            model_name_split = "/".join(model_rule.split("/")[1:])
-            models_list = []
-
-            # api_keys 中 api 为 sk- 时，表示继承 api_keys，将 api_keys 中的 api key 当作 渠道
-            if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-                if app.state.models_list.get(provider_name):
-                    models_list = app.state.models_list[provider_name]
-                else:
-                    models_list = []
-            else:
-                for provider in config['providers']:
-                    model_dict = provider["_model_dict_cache"]
-                    if provider['provider'] == provider_name:
-                        models_list.extend(list(model_dict.keys()))
-
-            # print("models_list", models_list)
-            # print("request_model", request_model)
-            # print("model_name_split", model_name_split)
-            # print("model", model)
-
-            # api_keys 中 model 为 provider_name/* 时，表示所有模型都匹配
-            if model_name_split == "*":
-                if request_model in models_list:
-                    provider_rules.append(provider_name + "/" + request_model)
-
-                # 如果请求模型名： gpt-4* ，则匹配所有以模型名开头且不以 * 结尾的模型
-                for models_list_model in models_list:
-                    if request_model.endswith("*") and models_list_model.startswith(request_model.rstrip("*")):
-                        provider_rules.append(provider_name + "/" + models_list_model)
-
-            # api_keys 中 model 为 provider_name/model_name 时，表示模型名完全匹配
-            elif model_name_split == request_model \
-            or (request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*"))): # api_keys 中 model 为 provider_name/model_name 时，请求模型名： model_name*
-                if model_name_split in models_list:
-                    provider_rules.append(provider_name + "/" + model_name_split)
-
-    else:
-        for provider in config["providers"]:
-            model_dict = provider["_model_dict_cache"]
-            if model_rule in model_dict.keys():
-                provider_rules.append(provider["provider"] + "/" + model_rule)
-
-    return provider_rules
-
-def get_provider_list(provider_rules, config, request_model):
-    provider_list = []
-    # print("provider_rules", provider_rules)
-    for item in provider_rules:
-        provider_name = item.split("/")[0]
-        if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-            provider_list.append({
-                "provider": provider_name,
-                "base_url": "http://127.0.0.1:8000/v1/chat/completions",
-                "model": [{request_model: request_model}],
-                "tools": True,
-                "_model_dict_cache": {request_model: request_model}
-            })
-        else:
-            for provider in config['providers']:
-                model_dict = provider["_model_dict_cache"]
-                if not model_dict:
-                    continue
-                model_name_split = "/".join(item.split("/")[1:])
-                if "/" in item and provider['provider'] == provider_name and model_name_split in model_dict.keys():
-                    if request_model in model_dict.keys() and model_name_split == request_model:
-                        new_provider = {
-                            "provider": provider["provider"],
-                            "base_url": provider.get("base_url", ""),
-                            "api": provider.get("api", None),
-                            "model": [{model_dict[model_name_split]: request_model}],
-                            "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
-                            "tools": provider.get("tools", False),
-                            "_model_dict_cache": provider["_model_dict_cache"],
-                            "project_id": provider.get("project_id", None),
-                            "private_key": provider.get("private_key", None),
-                            "client_email": provider.get("client_email", None),
-                            "cf_account_id": provider.get("cf_account_id", None),
-                            "aws_access_key": provider.get("aws_access_key", None),
-                            "aws_secret_key": provider.get("aws_secret_key", None),
-                            "engine":  provider.get("engine", None),
-                        }
-                        provider_list.append(new_provider)
-
-                    elif request_model.endswith("*") and model_name_split.startswith(request_model.rstrip("*")):
-                        new_provider = {
-                            "provider": provider["provider"],
-                            "base_url": provider.get("base_url", ""),
-                            "api": provider.get("api", None),
-                            "model": [{model_dict[model_name_split]: request_model}],
-                            "preferences": provider.get("preferences", {}),  # 可能也需要浅拷贝
-                            "tools": provider.get("tools", False),
-                            "_model_dict_cache": provider["_model_dict_cache"],
-                            "project_id": provider.get("project_id", None),
-                            "private_key": provider.get("private_key", None),
-                            "client_email": provider.get("client_email", None),
-                            "cf_account_id": provider.get("cf_account_id", None),
-                            "aws_access_key": provider.get("aws_access_key", None),
-                            "aws_secret_key": provider.get("aws_secret_key", None),
-                            "engine":  provider.get("engine", None),
-                        }
-                        provider_list.append(new_provider)
-    return provider_list
-
-async def get_matching_providers(request_model, config, api_index):
-    provider_rules = []
-
-    for model_rule in config['api_keys'][api_index]['model']:
-        provider_rules.extend(await get_provider_rules(model_rule, config, request_model))
-
-    provider_list = get_provider_list(provider_rules, config, request_model)
-
-    # print("provider_list", provider_list)
-    return provider_list
-
-async def get_right_order_providers(request_model, config, api_index, scheduling_algorithm, request_total_tokens=None):
-    matching_providers = await get_matching_providers(request_model, config, api_index)
-
-    # # 检查是否所有key都被速率限制
-    # available_providers = []
-    # for provider in matching_providers:
-    #     model_dict = get_model_dict(provider)
-    #     original_model = model_dict[request_model]
-    #     provider_name = provider['provider']
-    #     # 如果是本地API密钥（以sk-开头）
-    #     if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-    #         # 本地API密钥直接添加到可用列表中，因为它们的限制已在其他地方处理
-    #         available_providers.append(provider)
-    #     # 检查provider对应的API密钥列表是否都被速率限制
-    #     elif not await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
-    #         # 如果provider没有API密钥或至少有一个API密钥未被速率限制，则添加到可用列表
-    #         available_providers.append(provider)
-    #     else:
-    #         logger.warning(f"Provider {provider_name}: all API keys are rate limited!")
-
-    # # 使用筛选后的provider列表替换原始列表
-    # matching_providers = available_providers
-
-    # 筛查是否该请求token数量超过渠道tpr
-    if request_total_tokens and matching_providers:
-        available_providers = []
-        for provider in matching_providers:
-            model_dict = get_model_dict(provider)
-            original_model = model_dict[request_model]
-            provider_name = provider['provider']
-            if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-                # Local API keys are added directly as their limits are handled elsewhere
-                available_providers.append(provider)
-                continue
-
-            # First, check TPR limit
-            is_tpr_exceeded = await provider_api_circular_list[provider_name].is_tpr_exceeded(original_model, tokens=request_total_tokens)
-            if is_tpr_exceeded:
-                # logger.warning(f"Provider {provider_name} for model {request_model} is rate limited by TPR.")
-                continue
-            available_providers.append(provider)
-
-        matching_providers = available_providers
-
-        if not matching_providers:
-            raise HTTPException(status_code=413, detail=f"The request body is too long, No available providers at the moment: {request_model}")
-
-    # for provider in matching_providers:
-    #     print(provider['provider'])
-
-    if not matching_providers:
-        raise HTTPException(status_code=404, detail=f"No available providers at the moment: {request_model}")
-
-    num_matching_providers = len(matching_providers)
-    # 如果某个渠道的一个模型报错，这个渠道会被排除
-    if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1:
-        matching_providers = await app.state.channel_manager.get_available_providers(matching_providers)
-        num_matching_providers = len(matching_providers)
-        if not matching_providers:
-            raise HTTPException(status_code=503, detail="No available providers at the moment")
-
-    # for provider in matching_providers:
-    #     print(provider['provider'])
-
-    # 检查是否启用轮询
-    if scheduling_algorithm == "random":
-        matching_providers = random.sample(matching_providers, num_matching_providers)
-
-    weights = safe_get(config, 'api_keys', api_index, "weights")
-
-    if weights:
-        intersection = None
-        all_providers = set(provider['provider'] + "/" + request_model for provider in matching_providers)
-        if all_providers:
-            weight_keys = set(weights.keys())
-            provider_rules = []
-            for model_rule in weight_keys:
-                provider_rules.extend(await get_provider_rules(model_rule, config, request_model))
-            provider_list = get_provider_list(provider_rules, config, request_model)
-            weight_keys = set([provider['provider'] + "/" + request_model for provider in provider_list])
-            # print("all_providers", all_providers)
-            # print("weights", weights)
-            # print("weight_keys", weight_keys)
-
-            # 步骤 3: 计算交集
-            intersection = all_providers.intersection(weight_keys)
-            # print("intersection", intersection)
-            if len(intersection) == 1:
-                intersection = None
-
-        if intersection:
-            filtered_weights = {k.split("/")[0]: v for k, v in weights.items() if k.split("/")[0] + "/" + request_model in intersection}
-            # print("filtered_weights", filtered_weights)
-
-            if scheduling_algorithm == "weighted_round_robin":
-                weighted_provider_name_list = weighted_round_robin(filtered_weights)
-            elif scheduling_algorithm == "lottery":
-                weighted_provider_name_list = lottery_scheduling(filtered_weights)
-            else:
-                weighted_provider_name_list = list(filtered_weights.keys())
-            # print("weighted_provider_name_list", weighted_provider_name_list)
-
-            new_matching_providers = []
-            for provider_name in weighted_provider_name_list:
-                for provider in matching_providers:
-                    if provider['provider'] == provider_name:
-                        new_matching_providers.append(provider)
-            matching_providers = new_matching_providers
-
-    if is_debug:
-        for provider in matching_providers:
-            logger.info("available provider: %s", json.dumps(provider, indent=4, ensure_ascii=False, default=circular_list_encoder))
-
-    return matching_providers
-
 class ModelRequestHandler:
     def __init__(self):
         self.last_provider_indices = defaultdict(lambda: -1)
@@ -1695,283 +1450,177 @@ class ModelRequestHandler:
 
         current_info = request_info.get()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
-
-        scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-
-        request_total_tokens = 0
-        if request_data and isinstance(request_data, RequestModel):
-            for message in request_data.messages:
-                if message.content and isinstance(message.content, str):
-                    request_total_tokens += len(message.content)
-        request_total_tokens = int(request_total_tokens / 4)
-        # print("request_total_tokens", request_total_tokens)
-
-        matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm, request_total_tokens=request_total_tokens)
-        num_matching_providers = len(matching_providers)
-
-        status_code = 500
-        error_message = None
-
-        start_index = await _compute_start_index(
+        request_total_tokens = estimate_request_total_tokens(request_data)
+        plan = await RoutingPlan.create(
+            app,
+            request_model_name,
+            api_index,
             self.last_provider_indices,
             self.locks,
-            request_model_name,
-            scheduling_algorithm,
-            num_matching_providers,
+            request_total_tokens=request_total_tokens,
+            debug=is_debug,
+            provider_resolver=get_right_order_providers,
+        )
+        exclude_error_rate_limit = [
+            "BrokenResourceError",
+            "Proxy connection timed out",
+            "Unknown error: EndOfStream",
+            "'status': 'INVALID_ARGUMENT'",
+            "Unable to connect to service",
+            "Connection closed unexpectedly",
+            "Invalid JSON payload received. Unknown name ",
+            "User location is not supported for the API use",
+            "The model is overloaded. Please try again later.",
+            "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1007)",
+            "<title>Worker exceeded resource limits",
+        ]
+        runner = UpstreamRunner(
+            plan,
+            endpoint=endpoint,
+            debug=is_debug,
+            clear_provider_auth_cache=lambda provider_api_key_raw: _codex_oauth_cache.pop(provider_api_key_raw, None),
         )
 
-        auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
-        role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
-
-        retry_count = _compute_retry_count(matching_providers)
-        index = 0
-
-        while True:
+        async def before_next_attempt():
             if disconnect_event is not None and disconnect_event.is_set():
-                current_info = request_info.get()
                 return Response(content="", status_code=499)
-            # print("start_index", start_index)
-            # print("index", index)
-            # print("num_matching_providers", num_matching_providers)
-            # print("retry_count", retry_count)
-            if index > num_matching_providers + retry_count:
-                break
-            current_index = (start_index + index) % num_matching_providers
-            index += 1
-            provider = matching_providers[current_index]
+            return None
 
-            provider_name = provider['provider']
-            # print("current_index", current_index)
-            # print("provider_name", provider_name)
-
-            # 检查是否所有API密钥都被速率限制,如果被速率限制，则跳出循环
-            model_dict = provider["_model_dict_cache"]
-            original_model = model_dict[request_model_name]
-            if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
-                # logger.warning(f"Provider {provider_name}: All API keys are rate limited and stop auto retry!")
-                status_code = 429
-                error_message = "All API keys are rate limited and stop auto retry!"
-                if num_matching_providers == 1:
-                    break
-                else:
-                    continue
+        async def execute_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
 
             original_request_model = (original_model, request_data.model)
-            if provider_name.startswith("sk-") and provider_name in app.state.api_list:
-                local_provider_api_index = app.state.api_list.index(provider_name)
-                local_provider_scheduling_algorithm = safe_get(config, 'api_keys', local_provider_api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-                local_provider_matching_providers = await get_right_order_providers(request_model_name, config, local_provider_api_index, local_provider_scheduling_algorithm, request_total_tokens=request_total_tokens)
+            local_api_list = get_runtime_api_list()
+            if provider_name.startswith("sk-") and provider_name in local_api_list:
+                local_provider_api_index = local_api_list.index(provider_name)
+                local_provider_scheduling_algorithm = safe_get(
+                    config,
+                    "api_keys",
+                    local_provider_api_index,
+                    "preferences",
+                    "SCHEDULING_ALGORITHM",
+                    default="fixed_priority",
+                )
+                local_provider_matching_providers = await get_right_order_providers(
+                    request_model_name,
+                    config,
+                    local_provider_api_index,
+                    local_provider_scheduling_algorithm,
+                    local_api_list,
+                    app.state.models_list,
+                    channel_manager=app.state.channel_manager,
+                    request_total_tokens=request_total_tokens,
+                    debug=is_debug,
+                )
                 local_timeout_value = 0
                 for local_provider in local_provider_matching_providers:
-                    local_provider_name = local_provider['provider']
+                    local_provider_name = local_provider["provider"]
                     if not local_provider_name.startswith("sk-"):
-                        original_request_model = (local_provider["_model_dict_cache"][request_model_name], request_data.model)
-                        local_timeout_value += get_preference(app.state.provider_timeouts, local_provider_name, original_request_model, DEFAULT_TIMEOUT)
-                # print("local_timeout_value", provider_name, local_timeout_value)
+                        original_request_model = (
+                            local_provider["_model_dict_cache"][request_model_name],
+                            request_data.model,
+                        )
+                        local_timeout_value += get_preference(
+                            app.state.provider_timeouts,
+                            local_provider_name,
+                            original_request_model,
+                            DEFAULT_TIMEOUT,
+                        )
                 local_provider_num_matching_providers = len(local_provider_matching_providers)
             else:
-                local_timeout_value = get_preference(app.state.provider_timeouts, provider_name, original_request_model, DEFAULT_TIMEOUT)
+                local_timeout_value = get_preference(
+                    app.state.provider_timeouts,
+                    provider_name,
+                    original_request_model,
+                    DEFAULT_TIMEOUT,
+                )
                 local_provider_num_matching_providers = 1
-                # print("local_timeout_value", provider_name, local_timeout_value)
 
             local_timeout_value = local_timeout_value * local_provider_num_matching_providers
-            # print("local_timeout_value", provider_name, local_timeout_value)
-
-            keepalive_interval = get_preference(app.state.keepalive_interval, provider_name, original_request_model, 99999)
-            if keepalive_interval > local_timeout_value:
+            keepalive_interval = get_preference(
+                app.state.keepalive_interval,
+                provider_name,
+                original_request_model,
+                99999,
+            )
+            if keepalive_interval > local_timeout_value or provider_name.startswith("sk-"):
                 keepalive_interval = None
-            if provider_name.startswith("sk-"):
-                keepalive_interval = None
-            # print("keepalive_interval", provider_name, keepalive_interval)
 
-            try:
-                process_task = asyncio.create_task(
-                    process_request(
-                        request_data,
-                        provider,
-                        background_tasks,
-                        endpoint,
-                        role,
-                        local_timeout_value,
-                        keepalive_interval,
-                    )
+            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+            process_task = asyncio.create_task(
+                process_request(
+                    request_data,
+                    provider,
+                    background_tasks,
+                    endpoint,
+                    plan.role,
+                    local_timeout_value,
+                    keepalive_interval,
+                    provider_api_key_raw=attempt.provider_api_key_raw,
                 )
-                disconnect_task: Optional[asyncio.Task] = None
-                try:
-                    if disconnect_event is not None:
-                        disconnect_task = asyncio.create_task(disconnect_event.wait())
-                        done, pending = await asyncio.wait(
-                            [process_task, disconnect_task],
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        if disconnect_task in done and disconnect_event.is_set():
-                            process_task.cancel()
-                            with suppress(asyncio.CancelledError):
-                                await process_task
-                            current_info = request_info.get()
-                            return Response(content="", status_code=499)
-
-                    response = await process_task
-                finally:
-                    if disconnect_task is not None:
-                        disconnect_task.cancel()
+            )
+            disconnect_task: Optional[asyncio.Task] = None
+            try:
+                if disconnect_event is not None:
+                    disconnect_task = asyncio.create_task(disconnect_event.wait())
+                    done, pending = await asyncio.wait(
+                        [process_task, disconnect_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if disconnect_task in done and disconnect_event.is_set():
+                        process_task.cancel()
                         with suppress(asyncio.CancelledError):
-                            await disconnect_task
-                return response
+                            await process_task
+                        return Response(content="", status_code=499)
+
+                return await process_task
             except asyncio.CancelledError:
                 raise
-            except (Exception, HTTPException, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
-
-                # 如果客户端已经断开，不要再继续重试/打日志
+            except Exception:
                 if disconnect_event is not None and disconnect_event.is_set():
-                    current_info = request_info.get()
                     return Response(content="", status_code=499)
+                raise
+            finally:
+                if disconnect_task is not None:
+                    disconnect_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await disconnect_task
 
-                # 根据异常类型设置状态码和错误消息
-                if isinstance(e, httpx.ReadTimeout):
-                    status_code = 504  # Gateway Timeout
-                    timeout_value = e.request.extensions.get('timeout', {}).get('read', -1)
-                    error_message = f"Request timed out after {timeout_value} seconds"
-                elif isinstance(e, httpx.ConnectError):
-                    status_code = 503  # Service Unavailable
-                    error_message = "Unable to connect to service"
-                elif isinstance(e, httpx.ReadError):
-                    status_code = 502  # Bad Gateway
-                    error_message = "Network read error"
-                elif isinstance(e, httpx.RemoteProtocolError):
-                    status_code = 502  # Bad Gateway
-                    error_message = "Remote protocol error"
-                elif isinstance(e, httpx.LocalProtocolError):
-                    status_code = 502  # Bad Gateway
-                    error_message = "Local protocol error"
-                elif isinstance(e, HTTPException):
-                    status_code = e.status_code
-                    error_message = str(e.detail)
-                else:
-                    status_code = 500  # Internal Server Error
-                    error_message = str(e) or f"Unknown error: {e.__class__.__name__}"
+        def after_failure(attempt, exc, status_code, error_message):
+            _ = exc
+            logger.error(
+                "Error %s with provider %s API key: %s: %s",
+                status_code,
+                attempt.provider_name,
+                attempt.provider_api_key_raw,
+                error_message,
+            )
+            if is_debug or status_code == 500:
+                import traceback
 
-                exclude_error_rate_limit = [
-                    # "Internal Server Error",
-                    "BrokenResourceError",
-                    "Proxy connection timed out",
-                    "Unknown error: EndOfStream",
-                    "'status': 'INVALID_ARGUMENT'",
-                    "Unable to connect to service",
-                    "Connection closed unexpectedly",
-                    "Invalid JSON payload received. Unknown name ",
-                    "User location is not supported for the API use",
-                    "The model is overloaded. Please try again later.",
-                    "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1007)",
-                    "<title>Worker exceeded resource limits",
-                ]
+                traceback.print_exc()
 
-                channel_id = provider['provider']
+        def build_final_response(completed_plan):
+            current_info = request_info.get()
+            if isinstance(current_info, dict):
+                current_info["first_response_time"] = -1
+                current_info["success"] = False
+                current_info["provider"] = None
+            return JSONResponse(
+                status_code=completed_plan.status_code,
+                content={"error": f"All {request_data.model} error: {completed_plan.error_message}"},
+            )
 
-                if app.state.channel_manager.cooldown_period > 0 and num_matching_providers > 1 \
-                and all(error not in error_message for error in exclude_error_rate_limit):
-                    # 获取源模型名称（实际配置的模型名）
-                    # source_model = list(provider['model'][0].keys())[0]
-                    await app.state.channel_manager.exclude_model(channel_id, request_model_name)
-                    matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm, request_total_tokens=request_total_tokens)
-                    last_num_matching_providers = num_matching_providers
-                    num_matching_providers = len(matching_providers)
-                    if num_matching_providers != last_num_matching_providers:
-                        index = 0
-
-                quota_cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=0)
-                cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
-                rate_limit_cooling_time = _get_rate_limit_cooling_time(provider, status_code, error_message)
-                api_key_count = provider_api_circular_list[channel_id].get_items_count()
-                current_api = await provider_api_circular_list[channel_id].after_next_current()
-
-                # Codex refresh_token failures (401/403) should cool down the key so fixed_priority can fall back.
-                is_codex_refresh_failure = False
-                is_codex_permanent_auth_failure = False
-                try:
-                    failed_engine_for_cooldown, _ = get_engine(provider, endpoint, original_model)
-                    if failed_engine_for_cooldown == "codex" and status_code in (401, 403, 402):
-                        msg = str(error_message or "")
-                        if "Codex token refresh" in msg or "refresh_token_reused" in msg:
-                            is_codex_refresh_failure = True
-                        elif _is_codex_permanent_auth_error(status_code, msg):
-                            is_codex_permanent_auth_failure = True
-                except Exception:
-                    pass
-
-                if api_key_count > 1 and current_api and (is_codex_refresh_failure or is_codex_permanent_auth_failure):
-                    effective_quota_cooldown = int(quota_cooling_time) if int(quota_cooling_time) > 0 else 6 * 60 * 60
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=effective_quota_cooldown)
-                elif api_key_count > 1 and current_api and _is_quota_exhausted_error(status_code, error_message):
-                    effective_quota_cooldown = int(quota_cooling_time) if int(quota_cooling_time) > 0 else 6 * 60 * 60
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=effective_quota_cooldown)
-                elif api_key_count > 1 and current_api and rate_limit_cooling_time > 0:
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=rate_limit_cooling_time)
-                elif cooling_time > 0 and api_key_count > 1 \
-                and all(error not in error_message for error in exclude_error_rate_limit):
-                    await provider_api_circular_list[channel_id].set_cooling(current_api, cooling_time=cooling_time)
-
-                # 有些错误并没有请求成功，所以需要删除请求记录
-                if current_api and any(error in error_message for error in exclude_error_rate_limit) and provider_api_circular_list[provider_name].requests[current_api][original_model]:
-                    provider_api_circular_list[provider_name].requests[current_api][original_model].pop()
-
-                if "string_above_max_length" in error_message:
-                    status_code = 413
-                if "must be less than max_seq_len" in error_message:
-                    status_code = 413
-                if "Please reduce the length of the messages or completion" in error_message:
-                    status_code = 413
-                if "Request contains text fields that are too large." in error_message:
-                    status_code = 413
-                # openrouter
-                if "Please reduce the length of either one, or use the" in error_message:
-                    status_code = 413
-                # gemini
-                if "exceeds the maximum number of tokens allowed" in error_message:
-                    status_code = 413
-                if "'reason': 'API_KEY_INVALID'" in error_message or \
-                "API key not valid" in error_message or \
-                "API key expired" in error_message:
-                    status_code = 401
-                if "User location is not supported for the API use." in error_message:
-                    status_code = 403
-                if "<center><h1>400 Bad Request</h1></center>" in error_message:
-                    status_code = 502
-                if "Provider API error: bad response status code 400" in error_message:
-                    status_code = 502
-                if "The response was filtered due to the prompt triggering Azure OpenAI's content management policy." in error_message:
-                    status_code = 403
-                if "<head><title>413 Request Entity Too Large</title></head>" in error_message:
-                    status_code = 429
-
-                # If Codex access_token expired/invalid, clear cache so next retry refreshes it.
-                try:
-                    failed_engine, _ = get_engine(provider, endpoint, original_model)
-                except Exception:
-                    failed_engine = None
-                if failed_engine == "codex" and current_api and status_code in (401, 403):
-                    _codex_oauth_cache.pop(current_api, None)
-
-                logger.error(f"Error {status_code} with provider {channel_id} API key: {current_api}: {error_message}")
-                if is_debug or status_code == 500:
-                    import traceback
-                    traceback.print_exc()
-
-                if auto_retry and (status_code not in [400, 413] or urlparse(provider.get('base_url', '')).netloc == 'models.inference.ai.azure.com'):
-                    continue
-                else:
-                    return JSONResponse(
-                        status_code=status_code,
-                        content={"error": f"Error: Current provider response failed: {error_message}"}
-                    )
-
-        current_info = request_info.get()
-        current_info["first_response_time"] = -1
-        current_info["success"] = False
-        current_info["provider"] = None
-        return JSONResponse(
-            status_code=status_code,
-            content={"error": f"All {request_data.model} error: {error_message}"}
+        return await runner.run(
+            execute_attempt,
+            before_next_attempt=before_next_attempt,
+            after_failure=after_failure,
+            build_final_response=build_final_response,
+            exclude_error_substrings=exclude_error_rate_limit,
+            rollback_rate_limit_errors=exclude_error_rate_limit,
+            allow_channel_exclusion=True,
         )
 
 def _normalize_responses_upstream_url(base_url: str, engine: str) -> str:
@@ -2005,234 +1654,6 @@ def _normalize_responses_compact_upstream_url(base_url: str, engine: str) -> str
 
     return f"{base}/compact"
 
-def _is_quota_exhausted_error(status_code: int, details: str) -> bool:
-    if status_code == 401:
-        return False
-    text = (details or "").lower()
-    return any(
-        k in text
-        for k in (
-            "insufficient_quota",
-            "billing_hard_limit_reached",
-            "quota exceeded",
-            "exceeded your current quota",
-            "usage limit",
-            "out of credits",
-            "payment required",
-        )
-    )
-
-def _extract_error_details_parts(details: Any) -> tuple[Optional[str], Optional[str], Optional[str], str]:
-    raw = str(details or "")
-    code = None
-    error_type = None
-    message = None
-
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        parsed = None
-
-    if isinstance(parsed, dict):
-        err = parsed.get("error")
-        if isinstance(err, dict):
-            code = err.get("code")
-            error_type = err.get("type")
-            message = err.get("message")
-        detail = parsed.get("detail")
-        if isinstance(detail, dict):
-            code = detail.get("code") or code
-            error_type = detail.get("type") or error_type
-            message = detail.get("message") or message
-
-    if code is None and (raw.startswith("{") or raw.startswith("[")):
-        try:
-            import ast
-
-            parsed_py = ast.literal_eval(raw)
-        except Exception:
-            parsed_py = None
-        if isinstance(parsed_py, dict):
-            err = parsed_py.get("error")
-            if isinstance(err, dict):
-                code = err.get("code")
-                error_type = err.get("type")
-                message = err.get("message")
-            detail = parsed_py.get("detail")
-            if isinstance(detail, dict):
-                code = detail.get("code") or code
-                error_type = detail.get("type") or error_type
-                message = detail.get("message") or message
-
-    return (
-        str(code).strip().lower() or None,
-        str(error_type).strip().lower() or None,
-        str(message).strip() or None,
-        raw,
-    )
-
-def _is_retryable_rate_limit_error(status_code: int, details: Any) -> bool:
-    if status_code != 429:
-        return False
-
-    code, error_type, message, raw = _extract_error_details_parts(details)
-    haystack = " ".join(part for part in (code, error_type, message, raw) if part).lower()
-    return any(
-        token in haystack
-        for token in (
-            "rate_limit_exceeded",
-            "rate limit reached",
-            "too many requests",
-            "tokens per min",
-            "requests per min",
-            "tokens per day",
-            "requests per day",
-            "please try again in",
-        )
-    )
-
-def _extract_retry_after_seconds(details: Any) -> int:
-    _, _, message, raw = _extract_error_details_parts(details)
-    haystack = " ".join(part for part in (message, raw) if part)
-    match = re.search(
-        r"try again in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec|secs|seconds?|m|min|mins|minutes?)\b",
-        haystack,
-        re.IGNORECASE,
-    )
-    if not match:
-        return 0
-
-    value = float(match.group(1))
-    unit = match.group(2).lower()
-    if unit.startswith("ms"):
-        seconds = value / 1000.0
-    elif unit.startswith("m") and not unit.startswith("ms"):
-        seconds = value * 60.0
-    else:
-        seconds = value
-
-    return max(1, int(math.ceil(seconds)))
-
-def _get_rate_limit_cooling_time(provider: dict, status_code: int, details: Any) -> int:
-    if not _is_retryable_rate_limit_error(status_code, details):
-        return 0
-
-    configured = safe_get(
-        provider,
-        "preferences",
-        "api_key_rate_limit_cooldown_period",
-        default=30 * 60,
-    )
-    try:
-        configured_seconds = int(configured)
-    except Exception:
-        configured_seconds = 30 * 60
-
-    retry_after_seconds = _extract_retry_after_seconds(details)
-    if configured_seconds > 0:
-        return max(configured_seconds, retry_after_seconds)
-    if retry_after_seconds > 0:
-        return retry_after_seconds
-    return 30 * 60
-
-def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
-    if status_code not in (401, 403, 402):
-        return False
-
-    raw = str(details or "")
-    code = None
-    message = None
-
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        parsed = None
-
-    if isinstance(parsed, dict):
-        err = parsed.get("error")
-        if isinstance(err, dict):
-            code = err.get("code")
-            message = err.get("message")
-        detail = parsed.get("detail")
-        if code is None and isinstance(detail, dict):
-            code = detail.get("code")
-            message = detail.get("message") or message
-
-    # Some error paths stringify Python dicts (single quotes / None). Best-effort parse.
-    if code is None and (raw.startswith("{") or raw.startswith("[")):
-        try:
-            import ast
-
-            parsed_py = ast.literal_eval(raw)
-        except Exception:
-            parsed_py = None
-        if isinstance(parsed_py, dict):
-            err = parsed_py.get("error")
-            if isinstance(err, dict):
-                code = err.get("code")
-                message = err.get("message")
-            detail = parsed_py.get("detail")
-            if code is None and isinstance(detail, dict):
-                code = detail.get("code")
-                message = detail.get("message") or message
-
-    permanent_codes = {
-        "account_deactivated",
-        "account_disabled",
-        "account_suspended",
-        "deactivated_workspace",
-        "user_deactivated",
-        "user_suspended",
-        "organization_deactivated",
-        "organization_suspended",
-    }
-    if code and str(code).strip() in permanent_codes:
-        return True
-
-    haystack = (message or raw).lower()
-    return any(
-        k in haystack
-        for k in (
-            "account_deactivated",
-            "account_disabled",
-            "account_suspended",
-            "deactivated_workspace",
-            "organization_deactivated",
-            "user_deactivated",
-            "has been deactivated",
-            "has been suspended",
-        )
-    )
-
-async def _compute_start_index(
-    last_provider_indices: dict,
-    locks: dict,
-    request_model_name: str,
-    scheduling_algorithm: str,
-    num_matching_providers: int,
-) -> int:
-    start_index = 0
-    if scheduling_algorithm != "fixed_priority" and num_matching_providers > 1:
-        async with locks[request_model_name]:
-            last_provider_indices[request_model_name] = (last_provider_indices[request_model_name] + 1) % num_matching_providers
-            start_index = last_provider_indices[request_model_name]
-    return start_index
-
-def _compute_retry_count(matching_providers: list[dict]) -> int:
-    num_matching_providers = len(matching_providers)
-    if num_matching_providers <= 0:
-        return 0
-
-    if num_matching_providers == 1:
-        provider_name = safe_get(matching_providers, 0, "provider", default=None)
-        if provider_name:
-            count = provider_api_circular_list[provider_name].get_items_count()
-            if count > 1:
-                return count
-
-    tmp_retry_count = sum(provider_api_circular_list[p["provider"]].get_items_count() for p in matching_providers) * 2
-    return tmp_retry_count if tmp_retry_count < 10 else 10
-
 def _responses_request_id(current_info: Any) -> str:
     if isinstance(current_info, dict):
         request_id = current_info.get("request_id")
@@ -2257,39 +1678,13 @@ def _log_responses_downstream_disconnect(
         provider_name or "-",
     )
 
-def _build_upstream_error_response(status_code: int, error_message: Any, fallback_prefix: Optional[str] = None) -> JSONResponse:
-    parsed_error = None
-    if isinstance(error_message, (dict, list)):
-        parsed_error = error_message
-    elif isinstance(error_message, str):
-        stripped = error_message.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            try:
-                parsed_error = json.loads(stripped)
-            except Exception:
-                parsed_error = None
-
-    if parsed_error is not None:
-        return JSONResponse(status_code=status_code, content=parsed_error)
-
-    message_text = str(error_message)
-    if fallback_prefix:
-        message_text = f"{fallback_prefix}: {message_text}"
-    return JSONResponse(status_code=status_code, content={"error": message_text})
-
 RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset({
     "response.created",
     "response.in_progress",
     "response.queued",
 })
 
-RESPONSES_STREAM_NETWORK_ERRORS = (
-    httpx.ReadError,
-    httpx.RemoteProtocolError,
-    httpx.LocalProtocolError,
-    httpx.ReadTimeout,
-    httpx.ConnectError,
-)
+RESPONSES_STREAM_NETWORK_ERRORS = UPSTREAM_NETWORK_ERRORS
 
 RESPONSES_FAILURE_STATUS_BY_CODE = {
     "account_deactivated": 403,
@@ -2482,28 +1877,23 @@ class ResponsesRequestHandler:
         current_info = request_info.get()
         disconnect_event = current_info.get("disconnect_event") if isinstance(current_info, dict) else None
         request_id = _responses_request_id(current_info)
-
-        role = safe_get(config, 'api_keys', api_index, "role", default=safe_get(config, 'api_keys', api_index, "api", default="None")[:8])
-        scheduling_algorithm = safe_get(config, 'api_keys', api_index, "preferences", "SCHEDULING_ALGORITHM", default="fixed_priority")
-        matching_providers = await get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm)
-        num_matching_providers = len(matching_providers)
-
-        auto_retry = safe_get(config, 'api_keys', api_index, "preferences", "AUTO_RETRY", default=True)
-
-        status_code = 500
-        error_message = None
-
-        start_index = await _compute_start_index(
+        plan = await RoutingPlan.create(
+            app,
+            request_model_name,
+            api_index,
             self.last_provider_indices,
             self.locks,
-            request_model_name,
-            scheduling_algorithm,
-            num_matching_providers,
+            debug=is_debug,
+            provider_resolver=get_right_order_providers,
+        )
+        runner = UpstreamRunner(
+            plan,
+            endpoint=endpoint,
+            debug=is_debug,
+            clear_provider_auth_cache=lambda provider_api_key_raw: _codex_oauth_cache.pop(provider_api_key_raw, None),
         )
 
-        retry_count = _compute_retry_count(matching_providers)
-        index = 0
-        while True:
+        async def before_next_attempt():
             if disconnect_event is not None and disconnect_event.is_set():
                 _log_responses_downstream_disconnect(
                     endpoint,
@@ -2512,40 +1902,22 @@ class ResponsesRequestHandler:
                     stage="before-provider-select",
                 )
                 return Response(content="", status_code=499)
+            return None
 
-            if index > num_matching_providers + retry_count:
-                break
-            current_index = (start_index + index) % num_matching_providers
-            index += 1
-            provider = matching_providers[current_index]
-
-            provider_name = provider['provider']
-            model_dict = provider["_model_dict_cache"]
-            original_model = model_dict[request_model_name]
-
-            if await provider_api_circular_list[provider_name].is_all_rate_limited(original_model):
-                status_code = 429
-                error_message = "All API keys are rate limited and stop auto retry!"
-                if num_matching_providers == 1:
-                    break
-                continue
-
+        async def prepare_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
             engine, stream_mode = get_engine(provider, endpoint=endpoint, original_model=original_model)
             if stream_mode is not None:
                 request_data.stream = stream_mode
 
-            provider_api_key_raw = None
-            if provider_name.startswith("sk-"):
-                provider_api_key_raw = provider_name
-            elif provider.get("api"):
-                provider_api_key_raw = await provider_api_circular_list[provider_name].next(original_model)
-
+            attempt.state["failure_stage"] = "validation"
             if engine not in ("gpt", "codex"):
-                status_code = 400
-                error_message = f"{endpoint} only supports upstream engines: gpt/codex (got {engine})"
-                if not auto_retry:
-                    break
-                continue
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{endpoint} only supports upstream engines: gpt/codex (got {engine})",
+                )
 
             wants_compact = endpoint.rstrip("/").endswith("/compact")
             if wants_compact:
@@ -2554,70 +1926,58 @@ class ResponsesRequestHandler:
                 upstream_url = _normalize_responses_upstream_url(provider.get("base_url", ""), engine)
 
             if engine == "gpt" and "v1/responses" not in upstream_url:
-                status_code = 400
-                error_message = f"{endpoint} requires provider base_url ending with /v1/responses (got {upstream_url})"
-                if not auto_retry:
-                    break
-                continue
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{endpoint} requires provider base_url ending with /v1/responses (got {upstream_url})",
+                )
             if wants_compact and "compact" not in upstream_url:
-                status_code = 400
-                error_message = f"{endpoint} requires provider base_url ending with /v1/responses/compact (got {upstream_url})"
-                if not auto_retry:
-                    break
-                continue
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{endpoint} requires provider base_url ending with /v1/responses/compact (got {upstream_url})",
+                )
 
             proxy = safe_get(config, "preferences", "proxy", default=None)
             proxy = safe_get(provider, "preferences", "proxy", default=proxy)
+            channel_id = f"{provider_name}"
+            attempt.state["upstream_url"] = upstream_url
+            attempt.state["channel_id"] = channel_id
+            attempt.state["engine"] = engine
+            attempt.state["failure_stage"] = "auth"
 
-            api_key = provider_api_key_raw
+            attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
+            api_key = attempt.provider_api_key_raw
             codex_account_id = None
-            if engine == "codex" and provider_api_key_raw:
-                try:
-                    codex_account_id, _ = _split_codex_api_key(provider_api_key_raw)
-                except ValueError as e:
-                    status_code = 500
-                    error_message = str(e)
-                    trace_logger.error(
-                        "%s invalid codex api key request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
-                        endpoint,
-                        request_id,
-                        request_model_name,
-                        provider_name,
-                        provider_api_key_raw,
-                        upstream_url,
-                        error_message,
-                    )
-                    if not auto_retry:
-                        break
-                    continue
-                try:
-                    api_key = await _get_codex_access_token(provider_name, provider_api_key_raw, proxy)
-                except HTTPException as e:
-                    status_code = getattr(e, "status_code", 401)
-                    error_message = str(getattr(e, "detail", "")) or str(e)
-                    trace_logger.error(
-                        "%s codex token refresh failed request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
-                        endpoint,
-                        request_id,
-                        request_model_name,
-                        provider_name,
-                        provider_api_key_raw,
-                        upstream_url,
-                        error_message,
-                    )
-                    # If a Codex refresh_token is invalid/reused, treat it as a dead key and cool it down
-                    # so fixed_priority schedules can fall back to the next key immediately.
-                    if provider_api_key_raw and provider_name and not provider_name.startswith("sk-") and status_code in (401, 403):
-                        api_key_count = provider_api_circular_list[provider_name].get_items_count()
-                        if api_key_count > 1:
-                            cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=6 * 60 * 60)
-                            await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
-                    if not auto_retry:
-                        break
-                    continue
+            if engine == "codex" and attempt.provider_api_key_raw:
+                api_key, codex_account_id = await _resolve_codex_upstream_auth(
+                    provider_name,
+                    attempt.provider_api_key_raw,
+                    proxy,
+                )
 
-            timeout_value = get_preference(app.state.provider_timeouts, provider_name, (original_model, request_model_name), DEFAULT_TIMEOUT)
-            timeout_value = int(timeout_value)
+            timeout_value = get_preference(
+                app.state.provider_timeouts,
+                provider_name,
+                (original_model, request_model_name),
+                DEFAULT_TIMEOUT,
+            )
+            attempt.state["proxy"] = proxy
+            attempt.state["api_key"] = api_key
+            attempt.state["codex_account_id"] = codex_account_id
+            attempt.state["wants_compact"] = wants_compact
+            attempt.state["timeout_value"] = int(timeout_value)
+
+        async def execute_attempt(attempt):
+            provider = attempt.provider
+            provider_name = attempt.provider_name
+            original_model = attempt.original_model
+            engine = attempt.state["engine"]
+            proxy = attempt.state["proxy"]
+            api_key = attempt.state["api_key"]
+            codex_account_id = attempt.state["codex_account_id"]
+            wants_compact = attempt.state["wants_compact"]
+            timeout_value = attempt.state["timeout_value"]
+            upstream_url = attempt.state["upstream_url"]
+            channel_id = attempt.state["channel_id"]
 
             headers = {
                 "Content-Type": "application/json",
@@ -2655,13 +2015,12 @@ class ResponsesRequestHandler:
             if engine == "codex":
                 strip_unsupported_codex_payload_fields(payload, strip_store=wants_compact)
 
-            channel_id = f"{provider_name}"
             logger.info(
                 "provider: %-11s model: %-22s engine: %-13s role: %s",
                 channel_id[:11],
                 request_model_name,
                 engine[:13],
-                role,
+                plan.role,
             )
             trace_logger.info(
                 "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
@@ -2670,191 +2029,219 @@ class ResponsesRequestHandler:
                 channel_id[:11],
                 request_model_name,
                 engine[:13],
-                role,
+                plan.role,
                 upstream_url,
             )
 
-            try:
-                async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
-                    json_payload = await asyncio.to_thread(json.dumps, payload)
-                    if request_data.stream:
-                        stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
-                        upstream_resp = await stream_cm.__aenter__()
-                        if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
-                            raw = await upstream_resp.aread()
-                            await stream_cm.__aexit__(None, None, None)
-                            try:
-                                error_message = raw.decode("utf-8", errors="replace")
-                            except Exception:
-                                error_message = str(raw)
-                            status_code = upstream_resp.status_code
-                            raise HTTPException(status_code=status_code, detail=error_message)
-
-                        upstream_iter = upstream_resp.aiter_raw()
-                        try:
-                            buffered_chunks, stream_committed = await _prime_responses_upstream_stream(
-                                upstream_iter,
-                                disconnect_event=disconnect_event,
-                            )
-                        except HTTPException:
-                            await stream_cm.__aexit__(None, None, None)
-                            raise
-                        except RESPONSES_STREAM_NETWORK_ERRORS:
-                            await stream_cm.__aexit__(None, None, None)
-                            raise
-
-                        if disconnect_event is not None and disconnect_event.is_set():
-                            await stream_cm.__aexit__(None, None, None)
-                            _log_responses_downstream_disconnect(
-                                endpoint,
-                                current_info,
-                                model_id=request_model_name,
-                                provider_name=provider_name,
-                                stage="before-stream-commit",
-                            )
-                            return Response(content="", status_code=499)
-
-                        async def proxy_stream():
-                            try:
-                                for chunk in buffered_chunks:
-                                    if disconnect_event is not None and disconnect_event.is_set():
-                                        _log_responses_downstream_disconnect(
-                                            endpoint,
-                                            current_info,
-                                            model_id=request_model_name,
-                                            provider_name=provider_name,
-                                            stage="after-stream-commit",
-                                        )
-                                        return
-                                    yield chunk
-                                async for chunk in upstream_iter:
-                                    if disconnect_event is not None and disconnect_event.is_set():
-                                        _log_responses_downstream_disconnect(
-                                            endpoint,
-                                            current_info,
-                                            model_id=request_model_name,
-                                            provider_name=provider_name,
-                                            stage="after-stream-commit",
-                                        )
-                                        break
-                                    yield chunk
-                            except RESPONSES_STREAM_NETWORK_ERRORS as e:
-                                # Upstream may occasionally reset an HTTP/2 stream; avoid surfacing it as an ASGI exception.
-                                stream_stage = "post-commit" if stream_committed else "preflight"
-                                error_text = str(e) or type(e).__name__
-                                trace_logger.warning(
-                                    "%s upstream stream aborted stage=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
-                                    endpoint,
-                                    stream_stage,
-                                    type(e).__name__,
-                                    request_id,
-                                    request_model_name,
-                                    provider_name,
-                                    provider_api_key_raw,
-                                    upstream_url,
-                                    error_text,
-                                )
-                                # Once a semantic event has been emitted to the client we can no longer
-                                # switch providers safely, so we terminate the SSE stream cleanly.
-                                if stream_committed:
-                                    yield b"data: [DONE]\n\n"
-                            finally:
-                                await stream_cm.__aexit__(None, None, None)
-
-                        background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
-                        current_info["first_response_time"] = 0
-                        current_info["success"] = True
-                        current_info["provider"] = channel_id
-                        return StarletteStreamingResponse(proxy_stream(), media_type="text/event-stream")
-
-                    upstream_resp = await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+            attempt.state["failure_stage"] = "upstream"
+            attempt.state["track_channel_stats"] = True
+            async with app.state.client_manager.get_client(upstream_url, proxy, http2=False if engine == "codex" else None) as client:
+                json_payload = await asyncio.to_thread(json.dumps, payload)
+                if request_data.stream:
+                    stream_cm = client.stream("POST", upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                    upstream_resp = await stream_cm.__aenter__()
                     if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
                         raw = await upstream_resp.aread()
+                        await stream_cm.__aexit__(None, None, None)
                         try:
                             error_message = raw.decode("utf-8", errors="replace")
                         except Exception:
                             error_message = str(raw)
-                        status_code = upstream_resp.status_code
-                        raise HTTPException(status_code=status_code, detail=error_message)
+                        raise HTTPException(status_code=upstream_resp.status_code, detail=error_message)
 
-                    data = upstream_resp.json()
-                    semantic_failure = _responses_failure_http_exception(data)
-                    if semantic_failure is not None:
-                        raise semantic_failure
+                    upstream_iter = upstream_resp.aiter_raw()
+                    try:
+                        buffered_chunks, stream_committed = await _prime_responses_upstream_stream(
+                            upstream_iter,
+                            disconnect_event=disconnect_event,
+                        )
+                    except HTTPException:
+                        await stream_cm.__aexit__(None, None, None)
+                        raise
+                    except RESPONSES_STREAM_NETWORK_ERRORS:
+                        await stream_cm.__aexit__(None, None, None)
+                        raise
 
-                    background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=True, provider_api_key=provider_api_key_raw)
+                    if disconnect_event is not None and disconnect_event.is_set():
+                        await stream_cm.__aexit__(None, None, None)
+                        _log_responses_downstream_disconnect(
+                            endpoint,
+                            current_info,
+                            model_id=request_model_name,
+                            provider_name=provider_name,
+                            stage="before-stream-commit",
+                        )
+                        return Response(content="", status_code=499)
+
+                    async def proxy_stream():
+                        try:
+                            for chunk in buffered_chunks:
+                                if disconnect_event is not None and disconnect_event.is_set():
+                                    _log_responses_downstream_disconnect(
+                                        endpoint,
+                                        current_info,
+                                        model_id=request_model_name,
+                                        provider_name=provider_name,
+                                        stage="after-stream-commit",
+                                    )
+                                    return
+                                yield chunk
+                            async for chunk in upstream_iter:
+                                if disconnect_event is not None and disconnect_event.is_set():
+                                    _log_responses_downstream_disconnect(
+                                        endpoint,
+                                        current_info,
+                                        model_id=request_model_name,
+                                        provider_name=provider_name,
+                                        stage="after-stream-commit",
+                                    )
+                                    break
+                                yield chunk
+                        except RESPONSES_STREAM_NETWORK_ERRORS as e:
+                            stream_stage = "post-commit" if stream_committed else "preflight"
+                            error_text = str(e) or type(e).__name__
+                            trace_logger.warning(
+                                "%s upstream stream aborted stage=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                                endpoint,
+                                stream_stage,
+                                type(e).__name__,
+                                request_id,
+                                request_model_name,
+                                provider_name,
+                                attempt.provider_api_key_raw,
+                                upstream_url,
+                                error_text,
+                            )
+                            if stream_committed:
+                                yield b"data: [DONE]\n\n"
+                        finally:
+                            await stream_cm.__aexit__(None, None, None)
+
+                    background_tasks.add_task(
+                        update_channel_stats,
+                        current_info["request_id"],
+                        channel_id,
+                        request_model_name,
+                        current_info["api_key"],
+                        success=True,
+                        provider_api_key=attempt.provider_api_key_raw,
+                    )
                     current_info["first_response_time"] = 0
                     current_info["success"] = True
                     current_info["provider"] = channel_id
-                    return JSONResponse(status_code=upstream_resp.status_code, content=data)
+                    return StarletteStreamingResponse(proxy_stream(), media_type="text/event-stream")
 
-            except (HTTPException, httpx.ReadError, httpx.RemoteProtocolError, httpx.LocalProtocolError, httpx.ReadTimeout, httpx.ConnectError) as e:
-                background_tasks.add_task(update_channel_stats, current_info["request_id"], channel_id, request_model_name, current_info["api_key"], success=False, provider_api_key=provider_api_key_raw)
+                upstream_resp = await client.post(upstream_url, headers=headers, content=json_payload, timeout=timeout_value)
+                if upstream_resp.status_code < 200 or upstream_resp.status_code >= 300:
+                    raw = await upstream_resp.aread()
+                    try:
+                        error_message = raw.decode("utf-8", errors="replace")
+                    except Exception:
+                        error_message = str(raw)
+                    raise HTTPException(status_code=upstream_resp.status_code, detail=error_message)
 
-                status_code = getattr(e, "status_code", 500)
-                error_type = type(e).__name__
-                error_message = str(getattr(e, "detail", "")) or str(e) or error_type
+                data = upstream_resp.json()
+                semantic_failure = _responses_failure_http_exception(data)
+                if semantic_failure is not None:
+                    raise semantic_failure
 
-                is_codex_permanent_auth_failure = (
-                    engine == "codex"
-                    and provider_api_key_raw
-                    and status_code in (401, 403, 402)
-                    and _is_codex_permanent_auth_error(status_code, error_message)
+                background_tasks.add_task(
+                    update_channel_stats,
+                    current_info["request_id"],
+                    channel_id,
+                    request_model_name,
+                    current_info["api_key"],
+                    success=True,
+                    provider_api_key=attempt.provider_api_key_raw,
+                )
+                current_info["first_response_time"] = 0
+                current_info["success"] = True
+                current_info["provider"] = channel_id
+                return JSONResponse(status_code=upstream_resp.status_code, content=data)
+
+        def after_failure(attempt, exc, status_code, error_message):
+            if attempt.state.get("track_channel_stats"):
+                background_tasks.add_task(
+                    update_channel_stats,
+                    current_info["request_id"],
+                    attempt.state["channel_id"],
+                    request_model_name,
+                    current_info["api_key"],
+                    success=False,
+                    provider_api_key=attempt.provider_api_key_raw,
                 )
 
-                if engine == "codex" and provider_api_key_raw and status_code in (401, 403):
-                    _codex_oauth_cache.pop(provider_api_key_raw, None)
-
-                # Cool down keys on quota exhaustion by default (so dead accounts are skipped).
-                if provider_api_key_raw and provider_name and not provider_name.startswith("sk-") and status_code not in (400, 413):
-                    api_key_count = provider_api_circular_list[provider_name].get_items_count()
-                    if api_key_count > 1 and (_is_quota_exhausted_error(status_code, error_message) or is_codex_permanent_auth_failure):
-                        cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=6 * 60 * 60)
-                        await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
-                    elif api_key_count > 1:
-                        rate_limit_cooling_time = _get_rate_limit_cooling_time(provider, status_code, error_message)
-                        if rate_limit_cooling_time > 0:
-                            await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=rate_limit_cooling_time)
-                        else:
-                            cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
-                            if int(cooling_time) > 0:
-                                await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
-
+            upstream_url = attempt.state.get("upstream_url", "")
+            failure_stage = attempt.state.get("failure_stage")
+            if failure_stage == "auth" and isinstance(exc, ValueError):
                 trace_logger.error(
-                    "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                    "%s invalid codex api key request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
                     endpoint,
-                    status_code,
-                    error_type,
                     request_id,
                     request_model_name,
-                    channel_id,
-                    provider_api_key_raw,
+                    attempt.provider_name,
+                    attempt.provider_api_key_raw,
                     upstream_url,
                     error_message,
                 )
-
-                should_retry = auto_retry and (
-                    status_code not in (400, 413)
-                    or urlparse(provider.get("base_url", "")).netloc == 'models.inference.ai.azure.com'
+                return
+            if failure_stage == "auth" and isinstance(exc, HTTPException):
+                trace_logger.error(
+                    "%s codex token refresh failed request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                    endpoint,
+                    request_id,
+                    request_model_name,
+                    attempt.provider_name,
+                    attempt.provider_api_key_raw,
+                    upstream_url,
+                    error_message,
                 )
-                if should_retry:
-                    continue
+                return
 
-                current_info["first_response_time"] = -1
-                current_info["success"] = False
-                current_info["provider"] = None
-                return _build_upstream_error_response(
-                    status_code=status_code,
-                    error_message=error_message,
-                    fallback_prefix="Error: Current provider response failed",
-                )
+            trace_logger.error(
+                "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                endpoint,
+                status_code,
+                type(exc).__name__,
+                request_id,
+                request_model_name,
+                attempt.state.get("channel_id", attempt.provider_name),
+                attempt.provider_api_key_raw,
+                upstream_url,
+                error_message,
+            )
 
-        current_info["first_response_time"] = -1
-        current_info["success"] = False
-        current_info["provider"] = None
-        return JSONResponse(
-            status_code=status_code,
-            content={"error": f"All {request_model_name} error: {error_message}"},
+        def should_cool_down(exc, status_code, error_message, attempt):
+            _ = error_message, attempt
+            return not isinstance(exc, ValueError) and status_code not in (400, 413)
+
+        def build_error_response(status_code, error_message):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            return build_upstream_error_response(
+                status_code=status_code,
+                error_message=error_message,
+                fallback_prefix="Error: Current provider response failed",
+            )
+
+        def build_final_response(completed_plan):
+            current_info["first_response_time"] = -1
+            current_info["success"] = False
+            current_info["provider"] = None
+            return JSONResponse(
+                status_code=completed_plan.status_code,
+                content={"error": f"All {request_model_name} error: {completed_plan.error_message}"},
+            )
+
+        return await runner.run(
+            execute_attempt,
+            prepare_attempt=prepare_attempt,
+            before_next_attempt=before_next_attempt,
+            after_failure=after_failure,
+            build_error_response=build_error_response,
+            build_final_response=build_final_response,
+            should_cool_down=should_cool_down,
         )
 
 model_handler = ModelRequestHandler()
@@ -2863,7 +2250,7 @@ responses_handler = ResponsesRequestHandler()
 security = HTTPBearer()
 
 async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    api_list = app.state.api_list
+    api_list = get_runtime_api_list()
     token = credentials.credentials
     api_index = None
     try:
@@ -2877,7 +2264,7 @@ async def verify_api_key(credentials: HTTPAuthorizationCredentials = Depends(sec
     return api_index
 
 async def verify_admin_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    api_list = app.state.api_list
+    api_list = get_runtime_api_list()
     token = credentials.credentials
     api_index = None
     try:
@@ -2952,7 +2339,7 @@ async def responses_compact_route(
 
 @app.get("/v1/models", dependencies=[Depends(rate_limit_dependency)])
 async def list_models(api_index: int = Depends(verify_api_key)):
-    models = post_all_models(api_index, app.state.config, app.state.api_list, app.state.models_list)
+    models = post_all_models(api_index, app.state.config, get_runtime_api_list(), app.state.models_list)
     return JSONResponse(content={
         "object": "list",
         "data": models
@@ -3182,7 +2569,11 @@ async def api_config(api_index: int = Depends(verify_admin_api_key)):
 async def api_config_update(api_index: int = Depends(verify_admin_api_key), config: dict = Body(...)):
     if "providers" in config:
         app.state.config["providers"] = config["providers"]
-        app.state.config, app.state.api_keys_db, app.state.api_list = update_config(app.state.config, use_config_url=False)
+        app.state.config, app.state.api_keys_db, app.state.api_list = await update_config(
+            app.state.config,
+            use_config_url=False,
+        )
+        await refresh_runtime_state(app)
     return JSONResponse(content={"message": "API config updated"})
 
 # Pydantic Models for Token Usage Response
