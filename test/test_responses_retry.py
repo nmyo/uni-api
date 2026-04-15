@@ -413,7 +413,7 @@ def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatc
         _ = kwargs
         error_logs.append(msg % args if args else msg)
 
-    monkeypatch.setattr(main.logger, "error", fake_error)
+    monkeypatch.setattr(main.trace_logger, "error", fake_error)
 
     main.app.state.config = {
         "api_keys": [
@@ -452,6 +452,37 @@ def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatc
     assert any("/v1/responses/compact upstream error status=404" in log for log in error_logs)
     assert any("request_id=req-test" in log for log in error_logs)
     assert any("upstream_url=https://provider-a.example/v1/responses/compact" in log for log in error_logs)
+
+
+def test_responses_split_summary_and_trace_logs(monkeypatch):
+    _configure_responses_test(monkeypatch, engine="gpt")
+
+    human_logs = []
+    trace_logs = []
+
+    def fake_human_info(msg, *args, **kwargs):
+        _ = kwargs
+        human_logs.append(msg % args if args else msg)
+
+    def fake_trace_info(msg, *args, **kwargs):
+        _ = kwargs
+        trace_logs.append(msg % args if args else msg)
+
+    monkeypatch.setattr(main.logger, "info", fake_human_info)
+    monkeypatch.setattr(main.trace_logger, "info", fake_trace_info)
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert any("model: gpt-5.4" in log and "engine: gpt" in log and "role: sk-test" in log for log in human_logs)
+    assert all("request_id=" not in log for log in human_logs)
+    assert any("endpoint=/v1/responses" in log and "request_id=req-test" in log for log in trace_logs)
+    assert any("upstream_url=https://example.com/v1/responses" in log for log in trace_logs)
 
 
 def test_responses_gpt_keeps_max_output_tokens(monkeypatch):
@@ -833,7 +864,7 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
         _ = kwargs
         warning_logs.append(msg % args if args else msg)
 
-    monkeypatch.setattr(main.logger, "warning", fake_warning)
+    monkeypatch.setattr(main.trace_logger, "warning", fake_warning)
 
     main.app.state.config = {
         "api_keys": [

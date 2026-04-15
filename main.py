@@ -34,7 +34,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse as FastAPIStreamingResponse
 from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTasks, UploadFile, File, Form, Query
 
-from core.log_config import logger
+from core.log_config import logger, trace_logger
 from core.request import (
     apply_post_body_parameter_overrides,
     get_payload,
@@ -2248,7 +2248,7 @@ def _log_responses_downstream_disconnect(
     provider_name: Optional[str] = None,
     stage: str,
 ) -> None:
-    logger.info(
+    trace_logger.info(
         "%s downstream disconnect stage=%s request_id=%s model=%s provider=%s",
         endpoint,
         stage,
@@ -2577,7 +2577,7 @@ class ResponsesRequestHandler:
                 except ValueError as e:
                     status_code = 500
                     error_message = str(e)
-                    logger.error(
+                    trace_logger.error(
                         "%s invalid codex api key request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
                         endpoint,
                         request_id,
@@ -2595,7 +2595,7 @@ class ResponsesRequestHandler:
                 except HTTPException as e:
                     status_code = getattr(e, "status_code", 401)
                     error_message = str(getattr(e, "detail", "")) or str(e)
-                    logger.error(
+                    trace_logger.error(
                         "%s codex token refresh failed request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
                         endpoint,
                         request_id,
@@ -2657,6 +2657,13 @@ class ResponsesRequestHandler:
 
             channel_id = f"{provider_name}"
             logger.info(
+                "provider: %-11s model: %-22s engine: %-13s role: %s",
+                channel_id[:11],
+                request_model_name,
+                engine[:13],
+                role,
+            )
+            trace_logger.info(
                 "endpoint=%s request_id=%s provider=%-11s model=%-22s engine=%-13s role=%s upstream_url=%s",
                 endpoint,
                 request_id,
@@ -2735,7 +2742,7 @@ class ResponsesRequestHandler:
                                 # Upstream may occasionally reset an HTTP/2 stream; avoid surfacing it as an ASGI exception.
                                 stream_stage = "post-commit" if stream_committed else "preflight"
                                 error_text = str(e) or type(e).__name__
-                                logger.warning(
+                                trace_logger.warning(
                                     "%s upstream stream aborted stage=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
                                     endpoint,
                                     stream_stage,
@@ -2813,7 +2820,7 @@ class ResponsesRequestHandler:
                             if int(cooling_time) > 0:
                                 await provider_api_circular_list[provider_name].set_cooling(provider_api_key_raw, cooling_time=int(cooling_time))
 
-                logger.error(
+                trace_logger.error(
                     "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
                     endpoint,
                     status_code,
