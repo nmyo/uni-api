@@ -1590,10 +1590,13 @@ class ModelRequestHandler:
 
         def after_failure(attempt, exc, status_code, error_message):
             _ = exc
+            request_model, actual_model = _log_model_names(request_data.model, attempt.original_model)
             logger.error(
-                "Error %s with provider %s API key: %s: %s",
+                "Error %s with provider %s request_model=%s actual_model=%s API key: %s: %s",
                 status_code,
                 attempt.provider_name,
+                request_model,
+                actual_model,
                 attempt.provider_api_key_raw,
                 error_message,
             )
@@ -1653,6 +1656,11 @@ def _normalize_responses_compact_upstream_url(base_url: str, engine: str) -> str
         return base
 
     return f"{base}/compact"
+
+def _log_model_names(request_model_name: Any, actual_model_name: Any = None) -> tuple[str, str]:
+    request_model = str(request_model_name or "-")
+    actual_model = str(actual_model_name or request_model)
+    return request_model, actual_model
 
 def _responses_request_id(current_info: Any) -> str:
     if isinstance(current_info, dict):
@@ -2100,13 +2108,15 @@ class ResponsesRequestHandler:
                         except RESPONSES_STREAM_NETWORK_ERRORS as e:
                             stream_stage = "post-commit" if stream_committed else "preflight"
                             error_text = str(e) or type(e).__name__
+                            request_model, actual_model = _log_model_names(request_model_name, original_model)
                             trace_logger.warning(
-                                "%s upstream stream aborted stage=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                                "%s upstream stream aborted stage=%s error_type=%s request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
                                 endpoint,
                                 stream_stage,
                                 type(e).__name__,
                                 request_id,
-                                request_model_name,
+                                request_model,
+                                actual_model,
                                 provider_name,
                                 attempt.provider_api_key_raw,
                                 upstream_url,
@@ -2173,12 +2183,14 @@ class ResponsesRequestHandler:
 
             upstream_url = attempt.state.get("upstream_url", "")
             failure_stage = attempt.state.get("failure_stage")
+            request_model, actual_model = _log_model_names(request_model_name, attempt.original_model)
             if failure_stage == "auth" and isinstance(exc, ValueError):
                 trace_logger.error(
-                    "%s invalid codex api key request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                    "%s invalid codex api key request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
                     endpoint,
                     request_id,
-                    request_model_name,
+                    request_model,
+                    actual_model,
                     attempt.provider_name,
                     attempt.provider_api_key_raw,
                     upstream_url,
@@ -2187,10 +2199,11 @@ class ResponsesRequestHandler:
                 return
             if failure_stage == "auth" and isinstance(exc, HTTPException):
                 trace_logger.error(
-                    "%s codex token refresh failed request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                    "%s codex token refresh failed request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
                     endpoint,
                     request_id,
-                    request_model_name,
+                    request_model,
+                    actual_model,
                     attempt.provider_name,
                     attempt.provider_api_key_raw,
                     upstream_url,
@@ -2199,12 +2212,13 @@ class ResponsesRequestHandler:
                 return
 
             trace_logger.error(
-                "%s upstream error status=%s error_type=%s request_id=%s model=%s provider=%s key=%s upstream_url=%s: %s",
+                "%s upstream error status=%s error_type=%s request_id=%s request_model=%s actual_model=%s provider=%s key=%s upstream_url=%s: %s",
                 endpoint,
                 status_code,
                 type(exc).__name__,
                 request_id,
-                request_model_name,
+                request_model,
+                actual_model,
                 attempt.state.get("channel_id", attempt.provider_name),
                 attempt.provider_api_key_raw,
                 upstream_url,

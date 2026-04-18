@@ -445,7 +445,7 @@ def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatc
         return [
             {
                 "provider": provider_name,
-                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "_model_dict_cache": {"friendly-model": "gpt-5.4"},
                 "base_url": "https://provider-a.example/v1/responses",
                 "api": ["key-a"],
                 "preferences": {},
@@ -467,7 +467,7 @@ def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatc
         "api_keys": [
             {
                 "api": "sk-test",
-                "model": ["gpt-5.4"],
+                "model": ["friendly-model"],
                 "preferences": {"AUTO_RETRY": False},
             }
         ]
@@ -490,7 +490,7 @@ def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatc
 
     response = _run_responses_request(
         ResponsesRequest(
-            model="gpt-5.4",
+            model="friendly-model",
             input=[{"role": "user", "content": "hello"}],
         ),
         endpoint="/v1/responses/compact",
@@ -499,6 +499,8 @@ def test_responses_compact_non_stream_error_log_uses_compact_endpoint(monkeypatc
     assert response.status_code == 404
     assert any("/v1/responses/compact upstream error status=404" in log for log in error_logs)
     assert any("request_id=req-test" in log for log in error_logs)
+    assert any("request_model=friendly-model" in log for log in error_logs)
+    assert any("actual_model=gpt-5.4" in log for log in error_logs)
     assert any("upstream_url=https://provider-a.example/v1/responses/compact" in log for log in error_logs)
 
 
@@ -950,7 +952,7 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
         return [
             {
                 "provider": provider_name,
-                "_model_dict_cache": {"gpt-5.4": "gpt-5.4"},
+                "_model_dict_cache": {"friendly-model": "gpt-5.4"},
                 "base_url": "https://provider-a.example/v1/responses",
                 "api": ["key-a"],
                 "preferences": {},
@@ -972,7 +974,7 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
         "api_keys": [
             {
                 "api": "sk-test",
-                "model": ["gpt-5.4"],
+                "model": ["friendly-model"],
                 "preferences": {"AUTO_RETRY": False},
             }
         ]
@@ -996,7 +998,7 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
 
     response, body = _run_responses_request_with_stream_body(
         ResponsesRequest(
-            model="gpt-5.4",
+            model="friendly-model",
             input=[{"role": "user", "content": "hello"}],
             stream=True,
         ),
@@ -1008,6 +1010,8 @@ def test_responses_compact_stream_abort_log_uses_compact_endpoint(monkeypatch):
     assert body.endswith("data: [DONE]\n\n")
     assert any("/v1/responses/compact upstream stream aborted stage=post-commit" in log for log in warning_logs)
     assert any("error_type=RemoteProtocolError" in log for log in warning_logs)
+    assert any("request_model=friendly-model" in log for log in warning_logs)
+    assert any("actual_model=gpt-5.4" in log for log in warning_logs)
     assert any("request_id=req-test" in log for log in warning_logs)
     assert any("upstream_url=https://provider-a.example/v1/responses/compact" in log for log in warning_logs)
 

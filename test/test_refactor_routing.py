@@ -6,6 +6,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main
 from fastapi import BackgroundTasks
+from fastapi import HTTPException
 from starlette.responses import Response
 from core.models import RequestModel
 from routing import build_api_key_models_map
@@ -147,3 +148,81 @@ def test_model_request_handler_passes_selected_provider_key(monkeypatch):
         assert response.status_code == 200
 
     asyncio.run(run_test())
+
+
+def test_model_request_handler_error_log_includes_request_and_actual_model(monkeypatch):
+    provider_name = "provider-a"
+
+    class DummyCircularList:
+        async def is_all_rate_limited(self, model):
+            return False
+
+        async def next(self, model):
+            return "provider-key-1"
+
+        def get_items_count(self):
+            return 1
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "_model_dict_cache": {"friendly-model": "gpt-4.1"},
+                "base_url": "https://example.com/v1/chat/completions",
+                "api": ["provider-key-1"],
+                "preferences": {},
+            }
+        ]
+
+    async def fake_process_request(
+        request,
+        provider,
+        background_tasks,
+        endpoint=None,
+        role=None,
+        timeout_value=0,
+        keepalive_interval=None,
+        provider_api_key_raw=None,
+    ):
+        raise HTTPException(status_code=502, detail="bad gateway")
+
+    error_logs = []
+
+    def fake_error(msg, *args, **kwargs):
+        _ = kwargs
+        error_logs.append(msg % args if args else msg)
+
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, DummyCircularList())
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+    monkeypatch.setattr(main, "process_request", fake_process_request)
+    monkeypatch.setattr(main.logger, "error", fake_error)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["friendly-model"],
+                "preferences": {"AUTO_RETRY": False},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.keepalive_interval = {"global": {"default": 99999}}
+
+    async def run_test():
+        handler = main.ModelRequestHandler()
+        response = await handler.request_model(
+            RequestModel(
+                model="friendly-model",
+                messages=[{"role": "user", "content": "hello"}],
+                stream=False,
+            ),
+            0,
+            BackgroundTasks(),
+        )
+        assert response.status_code == 502
+
+    asyncio.run(run_test())
+
+    assert any("request_model=friendly-model" in log for log in error_logs)
+    assert any("actual_model=gpt-4.1" in log for log in error_logs)
