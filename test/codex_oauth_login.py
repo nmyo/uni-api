@@ -10,8 +10,10 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 OPENAI_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token"
@@ -19,10 +21,21 @@ OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 
 DEFAULT_PORT = 1455
 DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_SUB2API_OUTPUT = "sub2api-data.json"
+DEFAULT_PRIVACY_MODE = "training_set_cf_blocked"
+DEFAULT_CONCURRENCY = 10
+DEFAULT_PRIORITY = 1
+DEFAULT_RATE_MULTIPLIER = 1
+DEFAULT_AUTO_PAUSE_ON_EXPIRED = True
 
 
 def _b64url_no_pad(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(segment: str) -> bytes:
+    padded = segment + "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
 
 
 def _gen_pkce() -> tuple[str, str]:
@@ -43,10 +56,75 @@ def _jwt_claims_no_verify(id_token: str) -> dict:
     parts = (id_token or "").split(".")
     if len(parts) != 3:
         raise ValueError("invalid id_token: expected 3 JWT parts")
-    payload_b64 = parts[1]
-    payload_b64 += "=" * (-len(payload_b64) % 4)
-    payload_raw = base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+    payload_raw = _b64url_decode(parts[1])
     return json.loads(payload_raw.decode("utf-8"))
+
+
+def _nested_sections(section_name: str, *claims_list: dict[str, Any]) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    for claims in claims_list:
+        section = claims.get(section_name)
+        if isinstance(section, dict):
+            sections.append(section)
+    return sections
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+            continue
+        return value
+    return None
+
+
+def _nested_value(section_name: str, key: str, *claims_list: dict[str, Any]) -> Any:
+    for section in _nested_sections(section_name, *claims_list):
+        value = _first_non_empty(section.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _coerce_timestamp(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_expires_at(source: dict[str, Any], access_claims: dict[str, Any], exported_at: datetime) -> int | None:
+    access_exp = _coerce_timestamp(access_claims.get("exp"))
+    if access_exp is not None:
+        return access_exp
+
+    expires_in = _coerce_timestamp(source.get("expires_in"))
+    if expires_in is not None:
+        return int(exported_at.timestamp()) + max(expires_in, 0)
+    return None
+
+
+def _resolve_organization_id(auth_claims: dict[str, Any]) -> str | None:
+    organizations = auth_claims.get("organizations")
+    if not isinstance(organizations, list):
+        return None
+    for item in organizations:
+        if not isinstance(item, dict):
+            continue
+        org_id = _first_non_empty(item.get("id"))
+        if org_id is not None:
+            return str(org_id)
+    return None
+
+
+def _to_utc_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _extract_chatgpt_account_id(claims: dict) -> Optional[str]:
@@ -56,6 +134,103 @@ def _extract_chatgpt_account_id(claims: dict) -> Optional[str]:
         if isinstance(account_id, str) and account_id.strip():
             return account_id.strip()
     return None
+
+
+def build_sub2api_payload(
+    source: dict[str, Any],
+    *,
+    exported_at: datetime | None = None,
+    local_tz=None,
+    privacy_mode: str = DEFAULT_PRIVACY_MODE,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    priority: int = DEFAULT_PRIORITY,
+    rate_multiplier: int | float = DEFAULT_RATE_MULTIPLIER,
+    auto_pause_on_expired: bool = DEFAULT_AUTO_PAUSE_ON_EXPIRED,
+) -> dict[str, Any]:
+    if local_tz is None:
+        local_tz = datetime.now().astimezone().tzinfo
+
+    if exported_at is None:
+        exported_at = datetime.now(timezone.utc).replace(microsecond=0)
+        privacy_checked_at = datetime.now(local_tz)
+    else:
+        if exported_at.tzinfo is None:
+            exported_at = exported_at.replace(tzinfo=timezone.utc)
+        privacy_checked_at = exported_at.astimezone(local_tz)
+
+    access_token = str(source.get("access_token") or "")
+    id_token = str(source.get("id_token") or "")
+    refresh_token = str(source.get("refresh_token") or "")
+
+    access_claims = _jwt_claims_no_verify(access_token)
+    id_claims = _jwt_claims_no_verify(id_token)
+    auth_claims = _nested_sections("https://api.openai.com/auth", id_claims, access_claims)
+
+    email = _first_non_empty(
+        id_claims.get("email"),
+        _nested_value("https://api.openai.com/profile", "email", id_claims, access_claims),
+    )
+    account_id = _nested_value("https://api.openai.com/auth", "chatgpt_account_id", id_claims, access_claims)
+    user_id = _nested_value("https://api.openai.com/auth", "chatgpt_user_id", id_claims, access_claims)
+    plan_type = _nested_value("https://api.openai.com/auth", "chatgpt_plan_type", id_claims, access_claims)
+
+    organization_id = None
+    for auth_claim in auth_claims:
+        organization_id = _resolve_organization_id(auth_claim)
+        if organization_id is not None:
+            break
+
+    last_refresh_ts = _coerce_timestamp(_first_non_empty(access_claims.get("iat"), id_claims.get("iat")))
+    last_refresh = None
+    if last_refresh_ts is not None:
+        last_refresh = datetime.fromtimestamp(last_refresh_ts, tz=timezone.utc).astimezone(local_tz).isoformat()
+
+    expires_at = _resolve_expires_at(source, access_claims, exported_at)
+    if expires_at is not None:
+        expires_in = max(expires_at - int(exported_at.timestamp()), 0)
+    else:
+        expires_in = _coerce_timestamp(source.get("expires_in"))
+
+    display_name = _first_non_empty(email, account_id, user_id, "openai-oauth-account")
+    email_key = _first_non_empty(email, display_name)
+
+    account: dict[str, Any] = {
+        "name": display_name,
+        "platform": "openai",
+        "type": "oauth",
+        "credentials": {
+            "access_token": access_token,
+            "email": email,
+            "chatgpt_account_id": account_id,
+            "chatgpt_user_id": user_id,
+            "expires_at": expires_at,
+            "expires_in": expires_in,
+            "id_token": id_token,
+            "organization_id": organization_id,
+            "refresh_token": refresh_token,
+            "plan_type": plan_type,
+        },
+        "extra": {
+            "email": email,
+            "email_key": email_key,
+            "last_refresh": last_refresh,
+            "privacy_mode": privacy_mode,
+            "privacy_checked_at": privacy_checked_at.isoformat(),
+        },
+        "concurrency": concurrency,
+        "priority": priority,
+        "rate_multiplier": rate_multiplier,
+        "expires_at": expires_at,
+        "auto_pause_on_expired": auto_pause_on_expired,
+    }
+
+    return {
+        "type": "sub2api-data",
+        "version": 1,
+        "exported_at": _to_utc_z(exported_at),
+        "proxies": [],
+        "accounts": [account],
+    }
 
 
 @dataclass
@@ -162,13 +337,33 @@ def _exchange_code_for_tokens(code: str, code_verifier: str, redirect_uri: str) 
         raise RuntimeError(f"token exchange returned non-JSON: {raw}") from e
 
 
+def _render_login_outputs(account_id: str, refresh_token: str, sub2api_payload: dict) -> str:
+    return (
+        f"{account_id},{refresh_token}\n\n"
+        f"{json.dumps(sub2api_payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def _write_sub2api_output(sub2api_payload: dict, output_path: str) -> Path:
+    path = Path(output_path).expanduser()
+    if path.parent != Path():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sub2api_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path.resolve()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Codex OAuth login helper (outputs: <chatgpt_account_id>,<refresh_token>)",
+        description="Codex OAuth login helper (outputs: <chatgpt_account_id>,<refresh_token> and sub2api JSON)",
     )
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="callback port (default: 1455)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="wait timeout seconds (default: 300)")
     parser.add_argument("--no-browser", action="store_true", help="do not open browser automatically")
+    parser.add_argument(
+        "--sub2api-output",
+        default=DEFAULT_SUB2API_OUTPUT,
+        help=f"write sub2api JSON to this file (default: {DEFAULT_SUB2API_OUTPUT})",
+    )
     args = parser.parse_args()
 
     redirect_uri = f"http://localhost:{args.port}/auth/callback"
@@ -230,13 +425,19 @@ def main() -> int:
 
         claims = _jwt_claims_no_verify(id_token)
         account_id = _extract_chatgpt_account_id(claims)
+        print("account_id", account_id, file=sys.stderr)
+        print("token_resp", token_resp, file=sys.stderr)
         if not account_id:
             raise RuntimeError(
                 "missing chatgpt_account_id in id_token claims (expected claims['https://api.openai.com/auth']['chatgpt_account_id'])"
             )
 
+        sub2api_payload = build_sub2api_payload(token_resp)
+        saved_path = _write_sub2api_output(sub2api_payload, args.sub2api_output)
+        print(f"sub2api saved to {saved_path}", file=sys.stderr)
+
         # Output for uni-api config: "account_id,refresh_token"
-        print(f"{account_id},{refresh_token}")
+        print(_render_login_outputs(account_id, refresh_token, sub2api_payload))
         return 0
     finally:
         try:
