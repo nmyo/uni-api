@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 import os
 import sys
 
@@ -25,3 +26,10 @@ def test_codex_payload_uses_current_cli_version_headers():
     assert headers["Authorization"] == "Bearer access-token"
     assert headers["Version"] == "0.125.0"
     assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
+
+
+def test_responses_route_overrides_stale_client_codex_version_header():
+    main_source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+
+    assert 'headers.setdefault("Version", CODEX_CLI_VERSION)' in main_source
+    assert 'headers.setdefault("Version", http_request.headers.get("Version") or CODEX_CLI_VERSION)' not in main_source
