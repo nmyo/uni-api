@@ -1,12 +1,14 @@
 import os
 import sys
 import asyncio
+import json
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import RequestModel
 from core.request import get_payload
 from core.response import fetch_gpt_response_stream, _responses_output_to_text
+from core.utils import collect_openai_chat_completion_from_streaming_sse
 
 
 class _DummyStreamingResponse:
@@ -69,6 +71,35 @@ async def _collect_stream_body(chunks):
     return "".join(body_parts)
 
 
+async def _collect_non_stream_chat_completion(chunks):
+    client = _DummyClient(chunks)
+
+    async def converted_chunks():
+        async for chunk in fetch_gpt_response_stream(
+            client,
+            "https://example.com/v1/responses",
+            {"Accept": "text/event-stream"},
+            {
+                "model": "gpt-5.4",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "say test"}],
+                    }
+                ],
+                "stream": True,
+            },
+            30,
+        ):
+            yield chunk
+
+    return await collect_openai_chat_completion_from_streaming_sse(
+        converted_chunks(),
+        model="gpt-5.4",
+    )
+
+
 def test_fetch_gpt_response_stream_translates_image_output_item_done_and_drops_keepalive():
     chunks = [
         ": keepalive\n\n",
@@ -95,6 +126,34 @@ def test_fetch_gpt_response_stream_translates_image_output_item_done_and_drops_k
     assert '"id":"resp_img_done"' in body.replace(" ", "")
     assert '"finish_reason":"stop"' in body.replace(" ", "")
     assert body.rstrip().endswith("data: [DONE]")
+
+
+def test_codex_non_stream_collection_keeps_responses_usage():
+    chunks = [
+        (
+            'event: response.created\n'
+            'data: {"type":"response.created","response":{"id":"resp_usage","status":"in_progress","model":"gpt-5.4","created_at":1710000000}}\n\n'
+        ),
+        (
+            'event: response.output_text.delta\n'
+            'data: {"type":"response.output_text.delta","delta":"test"}\n\n'
+        ),
+        (
+            'event: response.completed\n'
+            'data: {"type":"response.completed","response":{"id":"resp_usage","model":"gpt-5.4","created_at":1710000000,"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9,"input_tokens_details":{"cached_tokens":1},"output_tokens_details":{"reasoning_tokens":3}}}}\n\n'
+        ),
+        "data: [DONE]\n\n",
+    ]
+
+    response_json = asyncio.run(_collect_non_stream_chat_completion(chunks))
+    response = json.loads(response_json)
+
+    assert response["choices"][0]["message"]["content"] == "test"
+    assert response["usage"]["prompt_tokens"] == 7
+    assert response["usage"]["completion_tokens"] == 2
+    assert response["usage"]["total_tokens"] == 9
+    assert response["usage"]["prompt_tokens_details"]["cached_tokens"] == 1
+    assert response["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3
 
 
 def test_responses_output_to_text_includes_image_generation_call():
