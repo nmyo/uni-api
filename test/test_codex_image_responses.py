@@ -4,6 +4,8 @@ import asyncio
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core.models import RequestModel
+from core.request import get_payload
 from core.response import fetch_gpt_response_stream, _responses_output_to_text
 
 
@@ -110,3 +112,35 @@ def test_responses_output_to_text_includes_image_generation_call():
 
     assert content == "![image](data:image/jpeg;base64,img-b64)"
     assert reasoning_content == ""
+
+
+def test_codex_gpt_image_2_payload_omits_chat_defaults_even_with_overrides():
+    request = RequestModel(
+        model="gpt-image-2",
+        messages=[{"role": "user", "content": "draw a meme"}],
+        stream=True,
+    )
+    provider = {
+        "provider": "fugue-codex",
+        "engine": "codex",
+        "base_url": "https://oaix.fugue.pro/v1/responses",
+        "api": "test-key",
+        "model": ["gpt-image-2"],
+        "preferences": {
+            "post_body_parameter_overrides": {
+                "parallel_tool_calls": True,
+                "reasoning": {"effort": "medium", "summary": "auto"},
+                "include": ["reasoning.encrypted_content"],
+            }
+        },
+        "tools": True,
+    }
+
+    _, _, payload = asyncio.run(get_payload(request, "codex", provider, api_key="test-key"))
+
+    assert payload["model"] == "gpt-image-2"
+    assert payload["stream"] is True
+    assert payload["store"] is False
+    assert "parallel_tool_calls" not in payload
+    assert "reasoning" not in payload
+    assert "include" not in payload
