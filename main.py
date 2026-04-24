@@ -1998,7 +1998,7 @@ class ResponsesRequestHandler:
                 headers.setdefault("Originator", http_request.headers.get("Originator") or "codex_cli_rs")
                 headers.setdefault("Version", http_request.headers.get("Version") or "0.21.0")
                 headers.setdefault("Session_id", http_request.headers.get("Session_id") or str(uuid.uuid4()))
-                headers.setdefault("User-Agent", http_request.headers.get("User-Agent") or "codex_cli_rs/0.50.0")
+                headers.setdefault("User-Agent", http_request.headers.get("User-Agent") or "codex_cli_rs/0.125.0")
                 headers.setdefault("Accept", "text/event-stream" if request_data.stream else "application/json")
                 if codex_account_id:
                     headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
