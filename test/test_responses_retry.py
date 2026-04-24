@@ -198,7 +198,7 @@ def _configure_responses_test(monkeypatch, *, engine, provider_preferences=None)
     return client_manager
 
 
-def _run_responses_request(request, *, endpoint="/v1/responses"):
+def _run_responses_request(request, *, endpoint="/v1/responses", http_headers=None):
     request_token = main.request_info.set(
         {
             "request_id": "req-test",
@@ -210,7 +210,7 @@ def _run_responses_request(request, *, endpoint="/v1/responses"):
         handler = main.ResponsesRequestHandler()
         return asyncio.run(
             handler.request_responses(
-                http_request=SimpleNamespace(headers={}),
+                http_request=SimpleNamespace(headers=http_headers or {}),
                 request_data=request,
                 api_index=0,
                 background_tasks=BackgroundTasks(),
@@ -682,6 +682,36 @@ def test_responses_codex_plain_bearer_api_key_skips_oauth(monkeypatch):
     sent_headers = main.app.state.client_manager.post_calls[0]["headers"]
     assert sent_headers["Authorization"] == "Bearer change-me"
     assert "Chatgpt-Account-Id" not in sent_headers
+
+
+def test_responses_codex_forces_current_client_headers_after_overrides(monkeypatch):
+    client_manager = _configure_responses_test(
+        monkeypatch,
+        engine="codex",
+        provider_preferences={
+            "headers": {
+                "version": "0.21.0",
+                "User-Agent": "codex_cli_rs/0.50.0",
+            }
+        },
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.4",
+            input=[{"role": "user", "content": "hello"}],
+        ),
+        http_headers={
+            "Version": "0.21.0",
+            "User-Agent": "yaak",
+        },
+    )
+
+    assert response.status_code == 200
+    sent_headers = client_manager.post_calls[0]["headers"]
+    assert sent_headers["Version"] == main.CODEX_CLI_VERSION
+    assert sent_headers["User-Agent"] == main.CODEX_USER_AGENT
+    assert "version" not in sent_headers
 
 
 def test_responses_stream_retries_next_provider_before_output(monkeypatch):

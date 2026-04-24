@@ -37,6 +37,7 @@ from core.request import (
     CODEX_CLI_VERSION,
     CODEX_USER_AGENT,
     apply_post_body_parameter_overrides,
+    force_codex_client_headers,
     get_payload,
     strip_unsupported_codex_payload_fields,
 )
@@ -1383,6 +1384,8 @@ async def process_request(
     if engine == "codex" and codex_account_id:
         headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
+    if engine == "codex":
+        force_codex_client_headers(headers)
     if is_debug:
         logger.info(url)
         logger.info(json.dumps(headers, indent=4, ensure_ascii=False))
@@ -2000,12 +2003,14 @@ class ResponsesRequestHandler:
                 headers.setdefault("Originator", http_request.headers.get("Originator") or "codex_cli_rs")
                 headers.setdefault("Version", CODEX_CLI_VERSION)
                 headers.setdefault("Session_id", http_request.headers.get("Session_id") or str(uuid.uuid4()))
-                headers.setdefault("User-Agent", http_request.headers.get("User-Agent") or CODEX_USER_AGENT)
+                headers.setdefault("User-Agent", CODEX_USER_AGENT)
                 headers.setdefault("Accept", "text/event-stream" if request_data.stream else "application/json")
                 if codex_account_id:
                     headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
 
             headers.update(safe_get(provider, "preferences", "headers", default={}) or {})
+            if engine == "codex":
+                force_codex_client_headers(headers)
 
             payload = request_data.model_dump(exclude_unset=True)
             payload["model"] = original_model

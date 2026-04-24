@@ -6,7 +6,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import RequestModel
-from core.request import get_codex_payload
+from core.request import force_codex_client_headers, get_codex_payload
 
 
 def test_codex_payload_uses_current_cli_version_headers():
@@ -28,8 +28,25 @@ def test_codex_payload_uses_current_cli_version_headers():
     assert headers["User-Agent"] == "codex_cli_rs/0.125.0"
 
 
+def test_force_codex_client_headers_removes_stale_case_variants():
+    headers = {
+        "version": "0.21.0",
+        "User-Agent": "yaak",
+        "X-Test": "kept",
+    }
+
+    force_codex_client_headers(headers)
+
+    assert headers == {
+        "X-Test": "kept",
+        "Version": "0.125.0",
+        "User-Agent": "codex_cli_rs/0.125.0",
+    }
+
+
 def test_responses_route_overrides_stale_client_codex_version_header():
     main_source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
 
     assert 'headers.setdefault("Version", CODEX_CLI_VERSION)' in main_source
     assert 'headers.setdefault("Version", http_request.headers.get("Version") or CODEX_CLI_VERSION)' not in main_source
+    assert "force_codex_client_headers(headers)" in main_source
