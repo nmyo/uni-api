@@ -34,6 +34,8 @@ from fastapi import FastAPI, HTTPException, Depends, Request, Body, BackgroundTa
 
 from core.log_config import logger, trace_logger
 from core.request import (
+    CODEX_CLI_VERSION,
+    CODEX_USER_AGENT,
     apply_post_body_parameter_overrides,
     get_payload,
     strip_unsupported_codex_payload_fields,
@@ -1996,9 +1998,9 @@ class ResponsesRequestHandler:
             if engine == "codex":
                 headers.setdefault("Openai-Beta", http_request.headers.get("Openai-Beta") or "responses=experimental")
                 headers.setdefault("Originator", http_request.headers.get("Originator") or "codex_cli_rs")
-                headers.setdefault("Version", http_request.headers.get("Version") or "0.21.0")
+                headers.setdefault("Version", http_request.headers.get("Version") or CODEX_CLI_VERSION)
                 headers.setdefault("Session_id", http_request.headers.get("Session_id") or str(uuid.uuid4()))
-                headers.setdefault("User-Agent", http_request.headers.get("User-Agent") or "codex_cli_rs/0.125.0")
+                headers.setdefault("User-Agent", http_request.headers.get("User-Agent") or CODEX_USER_AGENT)
                 headers.setdefault("Accept", "text/event-stream" if request_data.stream else "application/json")
                 if codex_account_id:
                     headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
