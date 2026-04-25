@@ -42,7 +42,7 @@ from core.request import (
     strip_unsupported_codex_payload_fields,
 )
 from core.response import fetch_response, fetch_response_stream
-from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
+from core.models import RequestModel, ResponsesRequest, ImageGenerationRequest, ImageEditRequest, AudioTranscriptionRequest, ModerationRequest, TextToSpeechRequest, UnifiedRequest, EmbeddingRequest
 from core.utils import (
     get_proxy,
     get_engine,
@@ -1328,7 +1328,7 @@ async def _resolve_codex_upstream_auth(
 
 # 在 process_request 函数中更新成功和失败计数
 async def process_request(
-    request: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
+    request: Union[RequestModel, ImageGenerationRequest, ImageEditRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
     provider: Dict,
     background_tasks: BackgroundTasks,
     endpoint=None,
@@ -1380,7 +1380,7 @@ async def process_request(
         logger.info(f"provider: {channel_id[:11]:<11} model: {request.model:<22} engine: {engine[:13]:<13} role: {role}")
 
     last_message_role = safe_get(request, "messages", -1, "role", default=None)
-    url, headers, payload = await get_payload(request, engine, provider, api_key)
+    url, headers, payload = await get_payload(request, engine, provider, api_key, endpoint=endpoint)
     if engine == "codex" and codex_account_id:
         headers.setdefault("Chatgpt-Account-Id", str(codex_account_id))
     headers.update(safe_get(provider, "preferences", "headers", default={}))  # add custom headers
@@ -1443,7 +1443,7 @@ class ModelRequestHandler:
 
     async def request_model(
         self,
-        request_data: Union[RequestModel, ImageGenerationRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
+        request_data: Union[RequestModel, ImageGenerationRequest, ImageEditRequest, AudioTranscriptionRequest, ModerationRequest, EmbeddingRequest],
         api_index: int,
         background_tasks: BackgroundTasks,
         endpoint=None,
@@ -2373,6 +2373,84 @@ async def images_generations(
     api_index: int = Depends(verify_api_key)
 ):
     return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/images/generations")
+
+def _is_form_upload(value: Any) -> bool:
+    return hasattr(value, "filename") and hasattr(value, "file")
+
+def _form_text(value: Any) -> Optional[str]:
+    if value is None or _is_form_upload(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+def _form_bool(value: Any, default: bool = False) -> bool:
+    text = _form_text(value)
+    if text is None:
+        return default
+    return text.lower() in ("1", "true", "yes", "on")
+
+async def _parse_image_edit_request(http_request: Request) -> ImageEditRequest:
+    content_type = (http_request.headers.get("content-type") or "").strip().lower()
+    if content_type.startswith("application/json"):
+        try:
+            body = await http_request.json()
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="Request body must be valid JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+        request = ImageEditRequest(**body)
+        request.request_type = "image"
+        return request
+
+    if content_type and not content_type.startswith("multipart/form-data"):
+        raise HTTPException(status_code=400, detail=f"Unsupported Content-Type {content_type!r}")
+
+    try:
+        form = await http_request.form()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid multipart form: {exc}") from exc
+
+    prompt = _form_text(form.get("prompt"))
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    model = _form_text(form.get("model")) or "gpt-image-2"
+    multipart_data: list[tuple[str, Any]] = []
+    multipart_files: list[tuple[str, Any]] = []
+    form_items = form.multi_items() if hasattr(form, "multi_items") else (
+        (key, value) for key in form.keys() for value in form.getlist(key)
+    )
+    for key, value in form_items:
+        if _is_form_upload(value):
+            multipart_files.append((
+                key,
+                (
+                    value.filename or "upload",
+                    value.file,
+                    value.content_type or "application/octet-stream",
+                ),
+            ))
+        else:
+            multipart_data.append((key, str(value)))
+
+    request = ImageEditRequest(
+        prompt=prompt,
+        model=model,
+        stream=_form_bool(form.get("stream"), False),
+        multipart_data=multipart_data,
+        multipart_files=multipart_files,
+    )
+    request.request_type = "image"
+    return request
+
+@app.post("/v1/images/edits", dependencies=[Depends(rate_limit_dependency)])
+async def images_edits(
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+    api_index: int = Depends(verify_api_key)
+):
+    request = await _parse_image_edit_request(http_request)
+    return await model_handler.request_model(request, api_index, background_tasks, endpoint="/v1/images/edits")
 
 @app.post("/v1/embeddings", dependencies=[Depends(rate_limit_dependency)])
 async def embeddings(

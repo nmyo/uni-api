@@ -411,7 +411,13 @@ async def error_handling_wrapper(generator, channel_id, engine, stream, error_tr
                 return first_item, first_response_time
             else:
                 first_item_str = first_item_str.decode("utf-8")
-        if isinstance(first_item_str, str) and not first_item_str.startswith(": keepalive"):
+        is_named_sse_frame = (
+            isinstance(first_item_str, str)
+            and stream
+            and engine == "dalle"
+            and first_item_str.lstrip().startswith("event:")
+        )
+        if isinstance(first_item_str, str) and not first_item_str.startswith(": keepalive") and not is_named_sse_frame:
             if first_item_str.startswith("data:"):
                 first_item_str = first_item_str.lstrip("data: ")
             if first_item_str.startswith("[DONE]"):
