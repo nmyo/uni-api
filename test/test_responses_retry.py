@@ -380,6 +380,70 @@ def test_responses_bad_request_does_not_retry_all_keys(monkeypatch):
     assert keys.cooling_calls == []
 
 
+def test_responses_codex_chatgpt_model_unsupported_retries_next_key(monkeypatch):
+    provider_name = "codex"
+    keys = main.ThreadSafeCircularList(
+        ["key-1", "key-2"],
+        provider_name=provider_name,
+    )
+    monkeypatch.setitem(main.provider_api_circular_list, provider_name, keys)
+
+    async def fake_get_right_order_providers(request_model_name, config, api_index, scheduling_algorithm):
+        return [
+            {
+                "provider": provider_name,
+                "engine": "codex",
+                "_model_dict_cache": {"gpt-5.5": "gpt-5.5"},
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api": ["key-1", "key-2"],
+                "preferences": {},
+            }
+        ]
+
+    monkeypatch.setattr(main, "get_right_order_providers", fake_get_right_order_providers)
+
+    main.app.state.config = {
+        "api_keys": [
+            {
+                "api": "sk-test",
+                "model": ["gpt-5.5"],
+                "preferences": {"AUTO_RETRY": True},
+            }
+        ]
+    }
+    main.app.state.provider_timeouts = {"global": {"default": 30}}
+    main.app.state.client_manager = SequencedDummyClientManager(
+        [
+            httpx.Response(
+                400,
+                request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+                json={
+                    "detail": "The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account."
+                },
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://chatgpt.com/backend-api/codex/responses"),
+                json={"id": "resp-b", "status": "completed"},
+            ),
+        ]
+    )
+
+    response = _run_responses_request(
+        ResponsesRequest(
+            model="gpt-5.5",
+            input=[{"role": "user", "content": "hello"}],
+        )
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["id"] == "resp-b"
+    assert [call["headers"]["Authorization"] for call in main.app.state.client_manager.post_calls] == [
+        "Bearer key-1",
+        "Bearer key-2",
+    ]
+
+
 def test_responses_codex_strips_max_output_tokens(monkeypatch):
     client_manager = _configure_responses_test(monkeypatch, engine="codex")
 

@@ -164,6 +164,30 @@ def _is_quota_exhausted_error(status_code: int, details: str) -> bool:
     )
 
 
+def _is_codex_chatgpt_model_unsupported_error(
+    status_code: int,
+    details: Any,
+    provider: dict,
+    endpoint: Optional[str],
+    original_model: Optional[str],
+) -> bool:
+    if status_code != 400:
+        return False
+    if endpoint != "/v1/responses":
+        return False
+
+    try:
+        engine, _ = get_engine(provider, endpoint, original_model or "")
+    except Exception:
+        engine = None
+    if engine != "codex":
+        return False
+
+    _, _, message, raw = _extract_error_details_parts(details)
+    haystack = " ".join(part for part in (message, raw) if part).lower()
+    return "model is not supported when using codex with a chatgpt account" in haystack
+
+
 def _is_codex_permanent_auth_error(status_code: int, details: str) -> bool:
     if status_code not in (401, 403, 402):
         return False
@@ -279,9 +303,19 @@ def remap_status_code_from_error(status_code: int, error_message: str) -> int:
     return status_code
 
 
-def should_retry_provider(auto_retry: Any, status_code: int, provider: dict) -> bool:
+def should_retry_provider(
+    auto_retry: Any,
+    status_code: int,
+    provider: dict,
+    *,
+    error_message: Any = None,
+    endpoint: Optional[str] = None,
+    original_model: Optional[str] = None,
+) -> bool:
     if not auto_retry:
         return False
+    if _is_codex_chatgpt_model_unsupported_error(status_code, error_message, provider, endpoint, original_model):
+        return True
     return status_code not in (400, 413) or urlparse(provider.get("base_url", "")).netloc == "models.inference.ai.azure.com"
 
 
@@ -643,7 +677,14 @@ class UpstreamRunner:
                 return UpstreamAttemptResult(should_retry=True)
             return UpstreamAttemptResult(finalize=True)
 
-        if should_retry_provider(self.plan.auto_retry, status_code, attempt.provider):
+        if should_retry_provider(
+            self.plan.auto_retry,
+            status_code,
+            attempt.provider,
+            error_message=error_message,
+            endpoint=self.endpoint,
+            original_model=attempt.original_model,
+        ):
             return UpstreamAttemptResult(should_retry=True)
 
         if build_error_response is not None:
