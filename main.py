@@ -1395,7 +1395,7 @@ async def process_request(
     # print("proxy", proxy)
 
     try:
-        async with app.state.client_manager.get_client(url, proxy) as client:
+        async with app.state.client_manager.get_client(url, proxy, http2=False if engine == "codex" else None) as client:
             downstream_stream = bool(getattr(request, "stream", None))
             force_collect_codex_stream = engine == "codex" and not downstream_stream and endpoint is None
 
