@@ -1395,7 +1395,7 @@ async def process_request(
     # print("proxy", proxy)
 
     try:
-        async with app.state.client_manager.get_client(url, proxy) as client:
+        async with app.state.client_manager.get_client(url, proxy, http2=False if engine == "codex" else None) as client:
             downstream_stream = bool(getattr(request, "stream", None))
             force_collect_codex_stream = engine == "codex" and not downstream_stream and endpoint is None
 
@@ -2422,11 +2422,18 @@ async def _parse_image_edit_request(http_request: Request) -> ImageEditRequest:
     )
     for key, value in form_items:
         if _is_form_upload(value):
+            try:
+                file_content = await value.read()
+            finally:
+                try:
+                    await value.close()
+                except Exception:
+                    pass
             multipart_files.append((
                 key,
                 (
                     value.filename or "upload",
-                    value.file,
+                    file_content,
                     value.content_type or "application/octet-stream",
                 ),
             ))

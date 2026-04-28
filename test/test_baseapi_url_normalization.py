@@ -4,11 +4,13 @@ import os
 import sys
 
 import pytest
+import httpx
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.models import ImageGenerationRequest, ImageEditRequest
 from core.request import get_dalle_payload
+from core.response import _build_multipart_content
 from core.utils import BaseAPI, get_engine
 
 
@@ -129,6 +131,27 @@ def test_get_dalle_payload_preserves_images_edits_multipart_without_json_content
         ("model", "gpt-image-2"),
     ]
     assert payload["__multipart_files__"] == [("image", ("image.png", image_file, "image/png"))]
+
+
+def test_multipart_content_builder_avoids_httpx_sync_files_stream():
+    headers, content = _build_multipart_content(
+        {"Authorization": "Bearer change-me", "Content-Type": "application/json"},
+        [("prompt", "edit this"), ("model", "gpt-image-2")],
+        [("image", ("image.png", BytesIO(b"image-bytes"), "image/png"))],
+    )
+
+    assert headers["Authorization"] == "Bearer change-me"
+    assert headers["Content-Type"].startswith("multipart/form-data; boundary=")
+    assert b'name="prompt"' in content
+    assert b'name="image"; filename="image.png"' in content
+    assert b"image-bytes" in content
+
+    client = httpx.AsyncClient()
+    try:
+        request = client.build_request("POST", "https://example.com/v1/images/edits", headers=headers, content=content)
+        assert hasattr(request.stream, "__aiter__")
+    finally:
+        asyncio.run(client.aclose())
 
 
 def test_get_engine_routes_images_edits_to_dalle_without_forcing_stream_mode():

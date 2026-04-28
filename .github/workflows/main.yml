@@ -6,12 +6,17 @@ on:
       - main
     paths:
       - main.py
+      - db.py
+      - routing.py
+      - upstream.py
       - utils.py
       - core/**
       - core
+      - static/**
       - Dockerfile
       - .dockerignore
       - pyproject.toml
+      - uv.lock
       - docker-compose.yml
       - .github/workflows/main.yml
       - .github/workflows/release.yml

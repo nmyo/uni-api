@@ -173,7 +173,7 @@ def _is_codex_chatgpt_model_unsupported_error(
 ) -> bool:
     if status_code != 400:
         return False
-    if endpoint != "/v1/responses":
+    if endpoint not in ("/v1/responses", "/v1/responses/compact"):
         return False
 
     try:
@@ -340,6 +340,13 @@ async def maybe_cool_provider_api_key(
     quota_cooling_time = safe_get(provider, "preferences", "api_key_quota_cooldown_period", default=0)
     cooling_time = safe_get(provider, "preferences", "api_key_cooldown_period", default=0)
     rate_limit_cooling_time = _get_rate_limit_cooling_time(provider, status_code, error_message)
+    is_codex_chatgpt_model_unsupported_failure = _is_codex_chatgpt_model_unsupported_error(
+        status_code,
+        error_message,
+        provider,
+        endpoint,
+        original_model,
+    )
 
     is_codex_refresh_failure = False
     is_codex_permanent_auth_failure = False
@@ -353,7 +360,12 @@ async def maybe_cool_provider_api_key(
     except Exception:
         pass
 
-    if is_codex_refresh_failure or is_codex_permanent_auth_failure or _is_quota_exhausted_error(status_code, error_message):
+    if (
+        is_codex_refresh_failure
+        or is_codex_permanent_auth_failure
+        or is_codex_chatgpt_model_unsupported_failure
+        or _is_quota_exhausted_error(status_code, error_message)
+    ):
         effective_quota_cooldown = int(quota_cooling_time) if int(quota_cooling_time) > 0 else 6 * 60 * 60
         await provider_api_circular_list[provider_name].set_cooling(
             provider_api_key_raw,
@@ -635,8 +647,15 @@ class UpstreamRunner:
             )
 
         should_cool_key = True
+        force_cool_key = _is_codex_chatgpt_model_unsupported_error(
+            status_code,
+            error_message,
+            attempt.provider,
+            self.endpoint,
+            attempt.original_model,
+        )
         if should_cool_down is not None:
-            should_cool_key = bool(
+            should_cool_key = force_cool_key or bool(
                 await _maybe_await(
                     should_cool_down(exc, status_code, error_message, attempt)
                 )
