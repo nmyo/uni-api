@@ -128,6 +128,31 @@ def test_fetch_gpt_response_stream_translates_image_output_item_done_and_drops_k
     assert body.rstrip().endswith("data: [DONE]")
 
 
+def test_fetch_gpt_response_stream_translates_responses_reasoning_summary():
+    chunks = [
+        (
+            'event: response.created\n'
+            'data: {"type":"response.created","response":{"id":"resp_reasoning","status":"in_progress","model":"gpt-image-2","created_at":1710000000}}\n\n'
+        ),
+        (
+            'event: response.reasoning_summary_text.delta\n'
+            'data: {"type":"response.reasoning_summary_text.delta","delta":"正在构思画面"}\n\n'
+        ),
+        (
+            'event: response.reasoning_summary_text.done\n'
+            'data: {"type":"response.reasoning_summary_text.done"}\n\n'
+        ),
+        "data: [DONE]\n\n",
+    ]
+
+    body = asyncio.run(_collect_stream_body(chunks))
+    compact_body = body.replace(" ", "")
+
+    assert '"reasoning_content":"正在构思画面"' in compact_body
+    assert '"reasoning_content":"\\n\\n"' in compact_body
+    assert body.rstrip().endswith("data: [DONE]")
+
+
 def test_codex_non_stream_collection_keeps_responses_usage():
     chunks = [
         (

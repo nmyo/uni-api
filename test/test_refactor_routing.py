@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import sys
 
@@ -77,6 +78,79 @@ def test_client_manager_reuses_single_client_under_concurrency(monkeypatch):
         assert len(created_clients) == 1
         assert len({id(client) for client in clients}) == 1
         await manager.close()
+
+    asyncio.run(run_test())
+
+
+def test_process_request_uses_http1_client_for_codex_chat(monkeypatch):
+    class DummyClient:
+        pass
+
+    class DummyClientManager:
+        def __init__(self):
+            self.calls = []
+
+        @contextlib.asynccontextmanager
+        async def get_client(self, base_url, proxy=None, http2=None):
+            self.calls.append({"base_url": base_url, "proxy": proxy, "http2": http2})
+            yield DummyClient()
+
+    async def fake_fetch_response_stream(client, url, headers, payload, engine, model, timeout):
+        _ = (client, url, headers, payload, engine, model, timeout)
+        yield (
+            'data: {"id":"chatcmpl-test","object":"chat.completion.chunk","created":1,'
+            '"model":"gpt-image-2","choices":[{"index":0,"delta":{"role":"assistant"},'
+            '"finish_reason":null}]}\n\n'
+        )
+
+    client_manager = DummyClientManager()
+    monkeypatch.setattr(main, "fetch_response_stream", fake_fetch_response_stream)
+    main.app.state.client_manager = client_manager
+    main.app.state.config = {"preferences": {}}
+    main.app.state.error_triggers = []
+
+    async def run_test():
+        token = main.request_info.set(
+            {
+                "request_id": "req-test",
+                "api_key": "sk-test",
+                "first_response_time": None,
+                "success": False,
+                "provider": None,
+            }
+        )
+        try:
+            response = await main.process_request(
+                RequestModel(
+                    model="gpt-image-2",
+                    messages=[{"role": "user", "content": "draw"}],
+                    stream=True,
+                ),
+                {
+                    "provider": "fugue-codex",
+                    "engine": "codex",
+                    "base_url": "https://oaix.fugue.pro/v1/responses",
+                    "api": "change-me",
+                    "model": ["gpt-image-2"],
+                    "_model_dict_cache": {"gpt-image-2": "gpt-image-2"},
+                    "preferences": {},
+                    "tools": True,
+                },
+                BackgroundTasks(),
+                role="admin",
+                timeout_value=30,
+                provider_api_key_raw="change-me",
+            )
+            assert response.status_code == 200
+            assert client_manager.calls == [
+                {
+                    "base_url": "https://oaix.fugue.pro/v1/responses",
+                    "proxy": None,
+                    "http2": False,
+                }
+            ]
+        finally:
+            main.request_info.reset(token)
 
     asyncio.run(run_test())
 
