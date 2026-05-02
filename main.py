@@ -1691,12 +1691,6 @@ def _log_responses_downstream_disconnect(
         provider_name or "-",
     )
 
-RESPONSES_STREAM_PREFLIGHT_EVENTS = frozenset({
-    "response.created",
-    "response.in_progress",
-    "response.queued",
-})
-
 RESPONSES_STREAM_NETWORK_ERRORS = UPSTREAM_NETWORK_ERRORS
 
 RESPONSES_FAILURE_STATUS_BY_CODE = {
@@ -1754,6 +1748,64 @@ def _extract_responses_stream_event(raw_event: str) -> tuple[str, Any]:
         event_name = str(parsed_payload.get("type") or "").strip()
 
     return event_name, parsed_payload
+
+def _responses_usage_from_payload(payload: Any) -> Optional[dict]:
+    if not isinstance(payload, dict):
+        return None
+
+    usage = safe_get(payload, "response", "usage", default=None)
+    if not isinstance(usage, dict):
+        usage = payload.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+def _responses_part_has_text(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+
+    text = part.get("text")
+    if isinstance(text, str) and text:
+        return True
+
+    refusal = part.get("refusal")
+    return isinstance(refusal, str) and bool(refusal)
+
+def _responses_item_has_substantive_output(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+
+    content = item.get("content")
+    if isinstance(content, list) and any(_responses_part_has_text(part) for part in content):
+        return True
+
+    item_type = str(item.get("type") or "")
+    if item_type in {"function_call", "tool_call"}:
+        return bool(item.get("name") or item.get("arguments") or item.get("call_id"))
+
+    return False
+
+def _responses_stream_event_has_real_output(event_type: str, payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    if event_type.startswith("response.") and event_type.endswith(".delta"):
+        return bool(str(payload.get("delta") or ""))
+
+    if event_type in {"response.content_part.added", "response.content_part.done"}:
+        return _responses_part_has_text(payload.get("part"))
+
+    if event_type == "response.output_item.done":
+        return _responses_item_has_substantive_output(payload.get("item"))
+
+    if event_type.startswith("response.") and event_type.endswith(".done"):
+        return bool(str(payload.get("text") or payload.get("refusal") or payload.get("arguments") or ""))
+
+    return False
+
+def _responses_stream_event_commits(event_type: str, payload: Any, commit_policy: str) -> bool:
+    completed_with_usage = event_type == "response.completed" and _responses_usage_from_payload(payload) is not None
+    if commit_policy == "completed_usage":
+        return completed_with_usage
+    return completed_with_usage or _responses_stream_event_has_real_output(event_type, payload)
 
 def _responses_error_status_code(error_obj: Any) -> int:
     if isinstance(error_obj, dict):
@@ -1823,14 +1875,18 @@ async def _prime_responses_upstream_stream(
     upstream_iter,
     *,
     disconnect_event: Optional[asyncio.Event] = None,
+    commit_policy: str = "real_output",
 ) -> tuple[list[bytes], bool]:
     """
-    Buffer only the initial status events so we can still fail over before any
-    user-visible / semantic Responses event has been sent downstream.
+    Buffer structural Responses events so we can still fail over before a
+    substantive output event or a completed response with usage is sent.
     """
     buffered_chunks: list[bytes] = []
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     text_buffer = ""
+    commit_policy = (commit_policy or "real_output").strip().lower()
+    if commit_policy not in {"real_output", "completed_usage"}:
+        commit_policy = "real_output"
 
     while True:
         if disconnect_event is not None and disconnect_event.is_set():
@@ -1843,7 +1899,7 @@ async def _prime_responses_upstream_stream(
                 raise HTTPException(status_code=502, detail="Upstream closed stream without data")
             if text_buffer.strip():
                 raise HTTPException(status_code=502, detail="Upstream closed stream with an incomplete SSE event")
-            return buffered_chunks, False
+            raise HTTPException(status_code=502, detail="Responses upstream closed before substantive output")
 
         buffered_chunks.append(chunk)
         text_buffer += decoder.decode(chunk)
@@ -1860,14 +1916,19 @@ async def _prime_responses_upstream_stream(
 
             event_type, event_payload = _extract_responses_stream_event(raw_event)
             if event_type == "[DONE]":
-                return buffered_chunks, False
+                raise HTTPException(
+                    status_code=502,
+                    detail="Responses upstream ended before substantive output",
+                )
 
             semantic_failure = _responses_failure_http_exception(event_payload)
             if semantic_failure is not None:
                 raise semantic_failure
 
-            if not event_type or event_type not in RESPONSES_STREAM_PREFLIGHT_EVENTS:
+            if _responses_stream_event_commits(event_type, event_payload, commit_policy):
                 return buffered_chunks, True
+
+            continue
 
 class ResponsesRequestHandler:
     def __init__(self):
@@ -1952,9 +2013,16 @@ class ResponsesRequestHandler:
             proxy = safe_get(config, "preferences", "proxy", default=None)
             proxy = safe_get(provider, "preferences", "proxy", default=proxy)
             channel_id = f"{provider_name}"
+            commit_policy = safe_get(
+                provider,
+                "preferences",
+                "responses_stream_commit_policy",
+                default="real_output",
+            )
             attempt.state["upstream_url"] = upstream_url
             attempt.state["channel_id"] = channel_id
             attempt.state["engine"] = engine
+            attempt.state["responses_stream_commit_policy"] = str(commit_policy or "real_output")
             attempt.state["failure_stage"] = "auth"
 
             attempt.provider_api_key_raw = await runner.select_provider_api_key(attempt)
@@ -1991,6 +2059,7 @@ class ResponsesRequestHandler:
             timeout_value = attempt.state["timeout_value"]
             upstream_url = attempt.state["upstream_url"]
             channel_id = attempt.state["channel_id"]
+            commit_policy = attempt.state.get("responses_stream_commit_policy", "real_output")
 
             headers = {
                 "Content-Type": "application/json",
@@ -2069,6 +2138,7 @@ class ResponsesRequestHandler:
                         buffered_chunks, stream_committed = await _prime_responses_upstream_stream(
                             upstream_iter,
                             disconnect_event=disconnect_event,
+                            commit_policy=commit_policy,
                         )
                     except HTTPException:
                         await stream_cm.__aexit__(None, None, None)
@@ -2089,6 +2159,33 @@ class ResponsesRequestHandler:
                         return Response(content="", status_code=499)
 
                     async def proxy_stream():
+                        completed_seen = False
+                        usage_seen = False
+                        output_seen = False
+                        proxy_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                        proxy_text_buffer = ""
+
+                        def track_responses_events(chunk: bytes) -> None:
+                            nonlocal completed_seen, usage_seen, output_seen, proxy_text_buffer
+                            proxy_text_buffer += proxy_decoder.decode(chunk)
+                            while True:
+                                match = re.search(r"\r?\n\r?\n", proxy_text_buffer)
+                                if not match:
+                                    break
+
+                                raw_event = proxy_text_buffer[:match.start()]
+                                proxy_text_buffer = proxy_text_buffer[match.end():]
+                                if not raw_event.strip():
+                                    continue
+
+                                event_type, event_payload = _extract_responses_stream_event(raw_event)
+                                if _responses_stream_event_has_real_output(event_type, event_payload):
+                                    output_seen = True
+                                if event_type == "response.completed":
+                                    completed_seen = True
+                                    if _responses_usage_from_payload(event_payload) is not None:
+                                        usage_seen = True
+
                         try:
                             for chunk in buffered_chunks:
                                 if disconnect_event is not None and disconnect_event.is_set():
@@ -2100,6 +2197,7 @@ class ResponsesRequestHandler:
                                         stage="after-stream-commit",
                                     )
                                     return
+                                track_responses_events(chunk)
                                 yield chunk
                             async for chunk in upstream_iter:
                                 if disconnect_event is not None and disconnect_event.is_set():
@@ -2111,6 +2209,7 @@ class ResponsesRequestHandler:
                                         stage="after-stream-commit",
                                     )
                                     break
+                                track_responses_events(chunk)
                                 yield chunk
                         except RESPONSES_STREAM_NETWORK_ERRORS as e:
                             stream_stage = "post-commit" if stream_committed else "preflight"
@@ -2132,6 +2231,18 @@ class ResponsesRequestHandler:
                             if stream_committed:
                                 yield b"data: [DONE]\n\n"
                         finally:
+                            if not completed_seen or not usage_seen:
+                                trace_logger.warning(
+                                    "%s upstream stream finished without completed usage request_id=%s model=%s provider=%s output_seen=%s completed_seen=%s usage_seen=%s upstream_url=%s",
+                                    endpoint,
+                                    request_id,
+                                    request_model_name,
+                                    provider_name,
+                                    output_seen,
+                                    completed_seen,
+                                    usage_seen,
+                                    upstream_url,
+                                )
                             await stream_cm.__aexit__(None, None, None)
 
                     background_tasks.add_task(
